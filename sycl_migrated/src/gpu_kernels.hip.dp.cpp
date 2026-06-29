@@ -6328,6 +6328,7 @@ extern "C" int gpu_seed_vram_cache(gpu_ctx_t *ctx, void *model_ptr, const char *
             }
         }
         seeded0 = seeded[0]; seeded1 = seeded[1];
+        (void)hipSetDevice(0);  // restore default after pingpong seeding
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
@@ -8863,31 +8864,33 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
             ctx->prof.pp_total_relay_h2d_bytes += relay_bytes;
             ctx->prof.pp_total_relay_dma_bytes += relay_bytes * 2;
 
-            // D2H: device d -> pinned host (use h_gpu1_norm as relay buffer)
-            // Use event-based sync instead of CPU-blocking hipStreamSynchronize
-            /*
-            DPCT1124:168: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
+            // D2H: device d -> pinned host relay buffer.
+            //
+            // BUG FIX (cross-device event / CAT fault):
+            // The original code recorded dc->batch_event on device-d's stream,
+            // then submitted ext_oneapi_submit_barrier({*dc->batch_event}) on
+            // next_dc->stream (device-(1-d)).  Intel Level Zero assigns every
+            // sycl::queue its own ZeContext; a ZeEvent from one context cannot
+            // be referenced by a command-list in a different context.  The driver
+            // places the raw event VA (e.g. 0x0000c001fe780000) directly into
+            // the other GPU's command stream as a semaphore address; when the CCS
+            // engine executes the wait it triggers an IOMMU fault → CAT error
+            // [18] → engine reset → ZE_RESULT_ERROR_DEVICE_LOST.
+            //
+            // Fix: CPU-side sync via s->wait().  This adds ~5–15 µs per relay
+            // (PCIe3 x1 round-trip latency) which is the same order as the
+            // hardware event path anyway.  A zero-CPU-overhead solution would
+            // require creating both queues with a shared sycl::context spanning
+            // both devices — left as a future optimisation.
             (void)DPCT_CHECK_ERROR(
                 s->memcpy(ctx->h_gpu1_norm, dc->d_x, n_embd * sizeof(float)));
-            (void)DPCT_CHECK_ERROR(
-                dpct::sync_barrier(dc->batch_event[dev_buf_set], s));
+            (void)DPCT_CHECK_ERROR(s->wait()); // CPU sync: h_gpu1_norm is now valid
 
-            // H2D: pinned host -> device 1-d
-            // Next device's stream waits for D2H event before reading relay buffer
+            // H2D: pinned host -> device next_d.
+            // No barrier or event needed: h_gpu1_norm is stable after s->wait().
+            // Kernels queued after this memcpy on next_dc->stream execute in
+            // FIFO order because it is an in-order SYCL queue.
             (void)dpct::select_device(next_d);
-            (void)DPCT_CHECK_ERROR((next_dc->stream)
-                                       ->ext_oneapi_submit_barrier(
-                                           {*dc->batch_event[dev_buf_set]}));
-            /*
-            DPCT1124:170: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
             (void)DPCT_CHECK_ERROR(next_dc->stream->memcpy(
                 next_dc->d_x, ctx->h_gpu1_norm, n_embd * sizeof(float)));
 
@@ -10623,15 +10626,17 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             }
 
             // GPU1 expert engine: collect partial sum and add to d_x.
-            // Use GPU-side stream wait instead of CPU-blocking hipEventSynchronize.
-            // GPU0's transfer stream waits for GPU1's event, relays h_gpu1_partial
-            // to d_gpu1_partial, then compute stream waits and does vec_add.
-            // The CPU never blocks — it can immediately proceed to cache updates
-            // and pre-queue the next layer's attention.
+            // BUG FIX: the original code used ts->ext_oneapi_submit_barrier(
+            // {*ctx->gpu1.cache_event}) where ts=GPU0's transfer stream and
+            // cache_event was recorded on GPU1's stream.  This is the same
+            // cross-context event bug as in the pingpong relay: Level Zero maps
+            // the foreign event VA into GPU0's command stream, the MMU faults,
+            // and the device is lost.  Fix: CPU-side wait on the GPU1 event.
             if (use_gpu1 && n_gpu1_total > 0) {
-                // Transfer stream: wait for GPU1 D2H, then H2D partial to GPU0
-                (void)DPCT_CHECK_ERROR(
-                    ts->ext_oneapi_submit_barrier({*ctx->gpu1.cache_event}));
+                // Wait for GPU1's weighted-sum + D2H (h_gpu1_partial) to complete
+                (void)DPCT_CHECK_ERROR(ctx->gpu1.cache_event->wait());
+
+                // H2D partial from pinned host to GPU0 device buffer
                 /*
                 DPCT1124:186: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on

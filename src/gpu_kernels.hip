@@ -5253,6 +5253,7 @@ extern "C" int gpu_seed_vram_cache(gpu_ctx_t *ctx, void *model_ptr, const char *
             }
         }
         seeded0 = seeded[0]; seeded1 = seeded[1];
+        (void)hipSetDevice(0);  // restore default after pingpong seeding
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
