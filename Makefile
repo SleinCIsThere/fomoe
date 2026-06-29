@@ -1,4 +1,5 @@
 CC = gcc
+.DEFAULT_GOAL := all
 CFLAGS = -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Iinclude
 COMMON_LDFLAGS = -lm -lpthread -fopenmp
 QWEN_LDFLAGS = $(COMMON_LDFLAGS) -luring
@@ -18,6 +19,16 @@ CFLAGS += -DQMOE_GPU -DFR_GPU -DFR_CUDA
 GPU_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart
 LINKER = $(CC)
 HIPCC = $(NVCC)
+
+else ifdef USE_SYCL
+SYCLCC ?= icpx
+SYCL_ARCH ?= intel_gpu_bmg_g31
+SYCL_CFLAGS = -O2 -fsycl -fsycl-targets=$(SYCL_ARCH) \
+              -Isycl_migrated/include -Iinclude -I/home/n/syclomatic/include \
+              -DFR_GPU -DFR_SYCL -DQMOE_GPU
+CFLAGS += -DQMOE_GPU -DFR_GPU -DFR_SYCL
+GPU_LDFLAGS = -fsycl -fsycl-targets=$(SYCL_ARCH)
+LINKER = $(SYCLCC)
 
 else ifdef USE_GPU
 HIPCC ?= hipcc
@@ -39,8 +50,19 @@ C_SRCS = src/expert_cache.c src/freq_profile.c src/car.c src/expert_store.c \
          src/inference.c src/main.c
 C_OBJS = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(C_SRCS))
 
-# HIP/CUDA source files (only when GPU enabled)
-ifneq (,$(or $(USE_CUDA),$(USE_GPU)))
+# SYCL, HIP/CUDA source files (only when GPU enabled)
+
+ifdef USE_SYCL
+GPU_SRCS = sycl_migrated/src/gpu_kernels.hip.dp.cpp sycl_migrated/src/tp.hip.dp.cpp
+GPU_OBJS = $(OBJ_DIR)/gpu_kernels.o $(OBJ_DIR)/tp.o
+
+$(OBJ_DIR)/gpu_kernels.o: sycl_migrated/src/gpu_kernels.hip.dp.cpp | $(OBJ_DIR)
+	$(SYCLCC) $(SYCL_CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/tp.o: sycl_migrated/src/tp.hip.dp.cpp | $(OBJ_DIR)
+	$(SYCLCC) $(SYCL_CFLAGS) -c $< -o $@
+
+else ifneq (,$(or $(USE_CUDA),$(USE_GPU)))
 GPU_SRCS = src/gpu_kernels.hip src/tp.hip
 GPU_OBJS = $(patsubst src/%.hip,$(OBJ_DIR)/%.o,$(GPU_SRCS))
 else
