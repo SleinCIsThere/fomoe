@@ -194,7 +194,12 @@ int ram_cache_init(ram_cache_t *c, int n_layers, int n_experts,
 }
 
 void ram_cache_free(ram_cache_t *c) {
+
+    if (!c->chunks)
+        return;
+    
     cache_meta_free(c->map, c->slot_layer, c->slot_expert, c->slot_ts);
+    free(c->chunks);
     memset(c, 0, sizeof(*c));
 }
 

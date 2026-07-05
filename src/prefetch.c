@@ -39,7 +39,7 @@ static void *prefetch_worker_fn(void *arg) {
         // Copy loaded experts to RAM cache slots
         for (int i = 0; i < n; i++) {
             int slot = ram_slots[i];
-            if (slot >= 0 && rcache && rcache->buf) {
+            if (slot >= 0 && rcache && rcache->chunks) {
                 void *dest = ram_cache_slot_ptr(rcache, slot);
                 memcpy(dest, out_buffers[i], rcache->expert_stride);
             }

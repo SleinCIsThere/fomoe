@@ -27,8 +27,11 @@ typedef struct {
 
 // RAM expert cache (layer-partitioned LRU, pinned host memory)
 typedef struct {
-    void     *buf;              // contiguous host memory (set externally or by init)
-    bool      pinned;           // true if hipHostRegister'd
+    void     **chunks;
+    uint64_t chunk_pinned[8]; //Limit of 8x64 = 512 chunks (1TiB for)
+    uint64_t chunk_size; // bytes per chunk (2 GiB (could be something else tho))
+    int      n_chunks;
+    bool      pinned;
     int       max_slots;
     int       slots_per_layer;
     int      *map;              // [n_layers * n_experts] → slot index or -1
@@ -52,6 +55,8 @@ int ram_cache_init(ram_cache_t *c, int n_layers, int n_experts,
 
 // Free metadata arrays (does NOT free d_buf or buf)
 void vram_cache_free(vram_cache_t *c);
+
+//Caller is in charge of freeing each chunk, because it's dependent on the backend.
 void ram_cache_free(ram_cache_t *c);
 
 // Lookup: returns slot index or -1. Bumps timestamp on hit.
@@ -62,9 +67,13 @@ int ram_cache_lookup(ram_cache_t *c, int layer, int expert_id);
 static inline void *vram_cache_slot_ptr(const vram_cache_t *c, int slot) {
     return (char *)c->d_buf + (uint64_t)slot * c->expert_stride;
 }
+
 static inline void *ram_cache_slot_ptr(const ram_cache_t *c, int slot) {
-    return (char *)c->buf + (uint64_t)slot * c->expert_stride;
-}
+    uint64_t byte_off = (uint64_t)slot * c->expert_stride;
+    int chunk_idx = (int)(byte_off / c->chunk_size);
+    uint64_t in_off = byte_off % c->chunk_size;
+    return (uint8_t*)c->chunks[chunk_idx] + in_off;
+} 
 
 // Allocate a slot for (layer, expert_id) by evicting the LRU in that layer.
 // Returns slot index. Updates map. Caller must fill the slot with data.

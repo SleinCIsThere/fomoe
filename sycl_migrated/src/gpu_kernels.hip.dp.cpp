@@ -292,7 +292,10 @@ typedef struct dpct_type_180803 {
 } vram_cache_t;
 
 typedef struct dpct_type_168260 {
-    void     *buf;
+    void     **chunks;
+    uint64_t chunk_pinned[8]; //Limit of 8x64 = 512 chunks (1TiB for now)
+    uint64_t chunk_size; // bytes per chunk (256 MiB or 4 GiB)
+    int      n_chunks;
     bool      pinned;
     int       max_slots;
     int       slots_per_layer;
@@ -321,6 +324,14 @@ int ram_cache_alloc_slot(ram_cache_t *c, int layer, int expert_id);
 static inline void vram_cache_touch(vram_cache_t *c, int slot) {
     c->slot_ts[slot] = ++c->ts;
 }
+
+static inline void *ram_cache_slot_ptr(const ram_cache_t *c, int slot) {
+    uint64_t byte_off = (uint64_t)slot * c->expert_stride;
+    int chunk_idx = (int)(byte_off / c->chunk_size);
+    uint64_t in_off = byte_off % c->chunk_size;
+    return (uint8_t*)c->chunks[chunk_idx] + in_off;
+} 
+
 static inline void ram_cache_touch(ram_cache_t *c, int slot) {
     c->slot_ts[slot] = ++c->ts;
 }
@@ -593,6 +604,7 @@ struct gpu_ctx {
     hipStream_t shared_stream;     // SharedFFN compute stream (overlaps with H2D)
     hipEvent_t  batch_event[2];    // sync events between streams
     hipEvent_t  shared_event;      // SharedFFN completion sync
+    sycl::context *rcache_shared_ctx;   // Multi device context
 
     // --- Expert FFN buffers (existing) ---
     void  *d_expert_staging;   // 2 * MAX_EXPERTS * MAX_EXPERT_STRIDE (double-buffered)
@@ -735,7 +747,7 @@ struct gpu_ctx {
 
         // Work: copy from scattered RAM cache slots to contiguous bounce buffer
         void    *bounce;        // destination base (h2d_bounce)
-        void    *cache;         // source base (rcache.buf)
+        ram_cache_t *rcache;     // was: void *cache;
         int      slots[16];     // source slot indices
         int      n;             // number of items
         uint64_t stride;
@@ -759,7 +771,7 @@ struct gpu_ctx {
         void    *srcs[16];      // source pointers (NVMe buffers or prefetch bufs)
         int      slots[16];     // destination slot indices in rcache
         int      n;             // number of items to copy
-        void    *cache_buf;     // rcache.buf
+        ram_cache_t *rcache;
         uint64_t stride;        // expert stride
     } rcache_pop;
 
@@ -3657,6 +3669,8 @@ static void dispatch_matvec_q8(hipStream_t s, const void *weight, int type,
 
 static void *rcache_pop_worker(void *arg) {
     gpu_ctx_t *ctx = (gpu_ctx_t *)arg;
+    ram_cache_t *rc = ctx->rcache_pop.rcache;
+    uint64_t stride = ctx->rcache_pop.stride;
 
     while (true) {
         pthread_mutex_lock(&ctx->rcache_pop.mutex);
@@ -3673,15 +3687,12 @@ static void *rcache_pop_worker(void *arg) {
         int slots[16];
         memcpy(srcs, ctx->rcache_pop.srcs, n * sizeof(void *));
         memcpy(slots, ctx->rcache_pop.slots, n * sizeof(int));
-        void *cache_buf = ctx->rcache_pop.cache_buf;
-        uint64_t stride = ctx->rcache_pop.stride;
         ctx->rcache_pop.work_ready = false;
         pthread_mutex_unlock(&ctx->rcache_pop.mutex);
 
         // Bulk memcpy: NVMe/prefetch buffers → pinned RAM cache slots
         for (int i = 0; i < n; i++) {
-            memcpy((uint8_t *)cache_buf + (size_t)slots[i] * stride,
-                   srcs[i], stride);
+            memcpy(ram_cache_slot_ptr(rc, slots[i]), srcs[i], stride);
         }
 
         pthread_mutex_lock(&ctx->rcache_pop.mutex);
@@ -3881,8 +3892,7 @@ static void backfill_try_complete(gpu_ctx_t *ctx) {
             continue;
         }
         int rslot = ram_cache_alloc_slot(bf.rcache, layer, eid);
-        memcpy((uint8_t *)bf.rcache->buf + (size_t)rslot * bf.expert_stride,
-               bf.buffers[i], bf.expert_stride);
+        memcpy(ram_cache_slot_ptr(bf.rcache, rslot), bf.buffers[i], bf.expert_stride);
         bf.total_backfilled++;
     }
 
@@ -3970,15 +3980,14 @@ static void *bounce_memcpy_worker(void *arg) {
         int slots[16];
         memcpy(slots, ctx->bounce_worker.slots, n * sizeof(int));
         void *bounce = ctx->bounce_worker.bounce;
-        void *cache = ctx->bounce_worker.cache;
         uint64_t stride = ctx->bounce_worker.stride;
         ctx->bounce_worker.work_ready = false;
         pthread_mutex_unlock(&ctx->bounce_worker.mutex);
 
         for (int i = 0; i < n; i++) {
             memcpy((uint8_t *)bounce + (size_t)i * stride,
-                   (uint8_t *)cache + (size_t)slots[i] * stride,
-                   stride);
+                ram_cache_slot_ptr(ctx->bounce_worker.rcache, slots[i]),
+                stride);
         }
 
         pthread_mutex_lock(&ctx->bounce_worker.mutex);
@@ -5895,70 +5904,101 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         }
 
         if (cache_budget > 0 && ctx->expert_stride > 0 && ctx->n_layers > 0) {
+
             int max_slots = (int)(cache_budget / ctx->expert_stride);
             int total_experts = ctx->n_layers * ctx->n_experts_total;
             if (max_slots > total_experts) max_slots = total_experts;
-
-            // Allocate buffer first, then init metadata
-            void *buf = nullptr;
-            bool pinned = false;
             int spl = max_slots / ctx->n_layers;
             max_slots = spl * ctx->n_layers;
 
             if (max_slots > 0) {
+
                 size_t alloc_sz = (size_t)max_slots * ctx->expert_stride;
+                uint64_t raw_chunk_sz    = 2ULL << 30;
+                uint64_t slots_per_chunk = raw_chunk_sz / ctx->expert_stride;
+                if (slots_per_chunk == 0) slots_per_chunk = 1; // degenerate: stride > 2 GiB
+                uint64_t chunk_sz        = slots_per_chunk * ctx->expert_stride; // exact multiple
 
-                // Skip hipHostMalloc for large allocs or multi-GPU — it can hang
-                // when GPU BAR space is exhausted. Use malloc + hipHostRegister instead.
-                if (!ctx->pingpong && alloc_sz < 12ULL * 1024 * 1024 * 1024) {
-                    hipError_t err = hipHostMalloc(&buf, alloc_sz, hipHostMallocDefault);
-                    if (err == hipSuccess) pinned = true;
-                }
-                if (!buf) {
-                    buf = malloc(alloc_sz);
-                    if (buf) {
-                        memset(buf, 0, alloc_sz);
-                        // Skip pinning for large allocations (>16GB) — hipHostRegister
-                        // of huge regions adds TLB/page-table overhead to ALL HIP calls,
-                        // causing ~15-20ms/token regression. Use bounce buffer instead.
-                        if (alloc_sz <= 17ULL * 1024 * 1024 * 1024) {
-                            hipError_t err = 0;
-                            if (err == hipSuccess) {
-                                pinned = true;
-                                ctx->rcache_registered = true;
-                                fprintf(stderr, "GPU: RAM cache: pinned %.1f GB\n",
-                                        (double)alloc_sz / (1024.0 * 1024.0 * 1024.0));
-                            } else {
-                                fprintf(stderr, "GPU: RAM cache: pin failed (%s), using bounce buffer\n",
-                                        hipGetErrorString(err));
-                            }
-                        } else {
-                            fprintf(stderr, "GPU: RAM cache: %.1f GB too large to pin, using bounce buffer\n",
-                                    (double)alloc_sz / (1024.0 * 1024.0 * 1024.0));
-                        }
-                    }
+                int n_chunks = (int)((alloc_sz + chunk_sz - 1) / chunk_sz);
+                                
+                void **chunks = (void **)calloc(n_chunks, sizeof(void*));
+                int good_chunks = 0;
+                bool all_pinned = true;
+                uint64_t chunk_pinned[8] = {0};
+
+                static_assert(sizeof(chunk_pinned) == sizeof(ctx->rcache.chunk_pinned), "Incorrect size for chunk pinned");
+
+                if(n_chunks > sizeof(chunk_pinned) * 8) {
+                    n_chunks = sizeof(chunk_pinned) * 8;
+                    alloc_sz  = (uint64_t)n_chunks * chunk_sz;
+                    fprintf(stderr, "GPU: RAM cache: Clamped to %u chunks\n", unsigned(sizeof(chunk_pinned) * 8));
                 }
 
-                if (buf && max_slots > 0) {
-                    if (ram_cache_init(&ctx->rcache, ctx->n_layers, ctx->n_experts_total,
-                                       max_slots, ctx->expert_stride) == 0) {
-                        ctx->rcache.buf = buf;
-                        ctx->rcache.pinned = pinned;
-                        fprintf(stderr, "GPU: RAM cache: %d slots (%d/layer, %.1f GB %s), %.1f%% of %d total experts\n",
-                                ctx->rcache.max_slots, ctx->rcache.slots_per_layer,
-                                (double)alloc_sz / (1024.0 * 1024.0 * 1024.0),
-                                pinned ? "pinned" : "unpinned",
-                                100.0 * ctx->rcache.max_slots / total_experts, total_experts);
+                std::vector<sycl::device> devs = { dpct::get_in_order_queue().get_device() };
+
+                if (ctx->pingpong && ctx->gpu1.device_id >= 0)
+                    devs.push_back(dpct::get_device(ctx->gpu1.device_id));
+
+                ctx->rcache_shared_ctx = new sycl::context(devs);
+
+                for (int i = 0; i < n_chunks; i++) {
+                    uint64_t this_sz = (i < n_chunks - 1)
+                        ? chunk_sz
+                        : (alloc_sz - (uint64_t)(n_chunks - 1) * chunk_sz);
+
+                    chunks[i] = sycl::malloc_host(this_sz, *ctx->rcache_shared_ctx);
+
+                    if (chunks[i]) {
+                        chunk_pinned[i / 64] |= (uint64_t)1 << (i & 63);
+                        ++good_chunks;
                     } else {
-                        // ram_cache_init failed
-                        if (ctx->rcache_registered) {
-                            ; free(buf);
-                        } else if (pinned)
-                            sycl::free(buf, dpct::get_in_order_queue());
-                        else free(buf);
+                        // round up to page size for aligned_alloc
+                        size_t aligned_sz = (this_sz + 4095) & ~(size_t)4095;
+                        chunks[i] = aligned_alloc(4096, aligned_sz);
+
+                        if(!chunks[i])
+                            break;
+
+                        ++good_chunks;
+                        chunk_pinned[i / 64] &= ~((uint64_t)1 << (i & 63));
+                        all_pinned = false;
                     }
+                }
+
+                int last_chunk_slots = (int)(
+                    (alloc_sz - (uint64_t)(n_chunks - 1) * chunk_sz) / ctx->expert_stride);
+                int actual_max = (n_chunks - 1) * (int)slots_per_chunk + last_chunk_slots;
+                int actual_spl = actual_max / ctx->n_layers;
+                max_slots = actual_spl * ctx->n_layers;
+
+                if (good_chunks == n_chunks &&
+                    ram_cache_init(&ctx->rcache, ctx->n_layers, ctx->n_experts_total,
+                                max_slots, ctx->expert_stride) == 0) {
+                    ctx->rcache.chunks       = chunks;
+                    memcpy(ctx->rcache.chunk_pinned, chunk_pinned, sizeof(chunk_pinned));
+                    ctx->rcache.chunk_size   = chunk_sz;
+                    ctx->rcache.n_chunks     = n_chunks;
+                    ctx->rcache.pinned       = all_pinned;
+                    fprintf(stderr,
+                        "GPU: RAM cache: %d slots (%d/layer, %.1f GB, %d chunks, %s), %.1f%% of %d total experts\n",
+                        ctx->rcache.max_slots, ctx->rcache.slots_per_layer,
+                        (double)alloc_sz / (1024.0 * 1024.0 * 1024.0), n_chunks,
+                        all_pinned ? "all pinned" : "mixed/unpinned",
+                        100.0 * ctx->rcache.max_slots / total_experts, total_experts);
                 } else {
-                    fprintf(stderr, "GPU: RAM cache: allocation failed, disabled\n");
+                    fprintf(stderr, "GPU: RAM cache: allocation failed (%d/%d chunks), disabled\n",
+                            good_chunks, n_chunks);
+                    for (int i = 0; i < n_chunks; i++) {
+
+                        if (!chunks[i])
+                            continue;
+
+                        if (chunk_pinned[i / 64] & ((uint64_t)1 << (i & 63)))
+                            (void)DPCT_CHECK_ERROR(sycl::free(chunks[i], *ctx->rcache_shared_ctx));
+
+                        else free(chunks[i]);
+                    }
+                    free(chunks);
                 }
             }
         }
@@ -5968,9 +6008,9 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     // Need n_experts_used buffers so all per-layer copies can be async simultaneously
     ctx->h2d_bounce = nullptr;
     ctx->h2d_bounce_slots = 0;
-    // Only allocate bounce buffer for unpinned RAM cache (needed for DMA).
-    // With pinned RAM, direct scattered H2D is faster (avoids serial CPU memcpy).
-    if (ctx->rcache.max_slots > 0 && !ctx->rcache.pinned) {
+    // only skip the bounce buffer if we're pinned AND ping-pong is active
+    // (single-GPU gpu_forward has no equivalent stream-wait before backfill eviction)
+    if (ctx->rcache.max_slots > 0 && (!ctx->rcache.pinned || !ctx->pingpong)) {
         size_t bounce_sz = (size_t)ctx->n_experts_used * ctx->expert_stride;
         hipError_t err = hipHostMalloc(&ctx->h2d_bounce, bounce_sz, hipHostMallocDefault);
         if (err == hipSuccess) {
@@ -5987,7 +6027,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     ctx->bounce_worker.shutdown = false;
     if (ctx->h2d_bounce && ctx->rcache.max_slots > 0) {
         ctx->bounce_worker.bounce = ctx->h2d_bounce;
-        ctx->bounce_worker.cache = ctx->rcache.buf;
+        ctx->bounce_worker.rcache = &ctx->rcache;
         ctx->bounce_worker.stride = ctx->expert_stride;
         pthread_mutex_init(&ctx->bounce_worker.mutex, NULL);
         pthread_cond_init(&ctx->bounce_worker.cond_work, NULL);
@@ -6004,7 +6044,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     ctx->rcache_pop.work_done = true;  // no pending work initially
     ctx->rcache_pop.shutdown = false;
     ctx->rcache_pop.n = 0;
-    ctx->rcache_pop.cache_buf = ctx->rcache.buf;
+    ctx->rcache_pop.rcache = &ctx->rcache;
     ctx->rcache_pop.stride = ctx->expert_stride;
     if (ctx->rcache.max_slots > 0) {
         pthread_mutex_init(&ctx->rcache_pop.mutex, NULL);
@@ -6426,7 +6466,7 @@ extern "C" int gpu_seed_vram_cache(gpu_ctx_t *ctx, void *model_ptr, const char *
                 int rslot = L * rspl + (i - vram_total);
                 void *buf = nullptr;
                 if (nvme_io_load_experts_at(io, L, &eid, 1, 0, &buf) != 0) continue;
-                memcpy((uint8_t *)ctx->rcache.buf + (size_t)rslot * stride, buf, stride);
+                memcpy(ram_cache_slot_ptr(&ctx->rcache, rslot), buf, stride);
                 ctx->rcache.slot_layer[rslot] = L;
                 ctx->rcache.slot_expert[rslot] = eid;
                 ctx->rcache.slot_ts[rslot] = ++ctx->rcache.ts;
@@ -6971,7 +7011,7 @@ static bool consume_prefetch_nvme(gpu_ctx_t *ctx) {
         */
         (void)DPCT_CHECK_ERROR(ts_pf->memcpy(
             (uint8_t *)ctx->ecache.d_buf + (size_t)pf_vslots[i] * stride_pf,
-            (uint8_t *)ctx->rcache.buf + (size_t)pf_rslots[i] * stride_pf,
+            ram_cache_slot_ptr(&ctx->rcache, pf_rslots[i]),
             stride_pf));
     }
     if (have_vram_cache && n_nvme_h2d > 0) ctx->prof.spec_prefetched += n_nvme_h2d;
@@ -7689,7 +7729,7 @@ static void *pp_spec_worker_fn(void *arg) {
                 rslot = w->rcache->map[w->next_il * w->rcache->n_experts + eid];
             if (rslot >= 0) {
                 pf_eids[n_to_pf] = eid;
-                pf_srcs[n_to_pf] = (uint8_t *)w->rcache->buf + (size_t)rslot * w->expert_stride;
+                pf_srcs[n_to_pf] = ram_cache_slot_ptr(w->rcache, rslot);
                 ram_cache_touch(w->rcache, rslot);
                 n_to_pf++;
             } else if (w->nvme_io && ctx->spec_nvme_n[w->next_il] < 8) {
@@ -8560,13 +8600,14 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         if (n_ramhit > 0) {
             void *ramhit_srcs[16];
             for (int j = 0; j < n_ramhit; j++) {
-                ramhit_srcs[j] = (uint8_t *)ctx->rcache.buf + (size_t)ramhit_slot[j] * stride;
+                ramhit_srcs[j] = ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]);
             }
             if (ctx->h2d_bounce && n_ramhit > 0) {
                 // Use bounce buffer for coalesced transfer
                 for (int j = 0; j < n_ramhit; j++) {
-                    memcpy((uint8_t *)ctx->h2d_bounce + (size_t)j * stride,
-                           ramhit_srcs[j], stride);
+                memcpy((uint8_t *)ctx->h2d_bounce + (size_t)j * stride,
+                    ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]),
+                    stride);
                 }
                 /*
                 DPCT1124:164: cudaMemcpyAsync is migrated to asynchronous memcpy
@@ -8587,9 +8628,9 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
                     synchronization behavior.
                     */
                     (void)DPCT_CHECK_ERROR(
-                        ts->memcpy((uint8_t *)dc->d_expert_staging + stg_base +
-                                       (size_t)j * stride,
-                                   ramhit_srcs[j], stride));
+                        ts->memcpy((uint8_t *)dc->d_expert_staging + stg_base + (size_t)j * stride,
+                                ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]),
+                                stride));
                 }
             }
         }
@@ -9651,11 +9692,10 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                     synchronization behavior.
                     */
                     (void)DPCT_CHECK_ERROR(
-                        ts1->memcpy((uint8_t *)ctx->gpu1.d_expert_staging +
-                                        gpu1_stg_base + (size_t)j * stride,
-                                    (uint8_t *)ctx->rcache.buf +
-                                        (size_t)gpu1_p2_slot[j] * stride,
-                                    stride));
+                        ts1->memcpy(
+                            (uint8_t *)ctx->gpu1.d_expert_staging + gpu1_stg_base + (size_t)j * stride,
+                            ram_cache_slot_ptr(&ctx->rcache, gpu1_p2_slot[j]),
+                            stride));
                 }
                 (void)DPCT_CHECK_ERROR(
                     dpct::sync_barrier(ctx->gpu1.batch_event[buf_set], ts1));
@@ -10258,7 +10298,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                 (void)DPCT_CHECK_ERROR(ts->memcpy(
                     (uint8_t *)ctx->ecache.d_buf +
                         (size_t)pfa_vslots[i] * stride,
-                    (uint8_t *)ctx->rcache.buf + (size_t)pfa_rslots[i] * stride,
+                    ram_cache_slot_ptr(&ctx->rcache, pfa_rslots[i]),
                     stride));
             }
 
@@ -10314,7 +10354,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                 } else {
                     for (int j = 0; j < n_ramhit; j++) {
                         memcpy((uint8_t *)ctx->h2d_bounce + (size_t)j * stride,
-                               (uint8_t *)ctx->rcache.buf + (size_t)ramhit_slot[j] * stride,
+                               ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]),
                                stride);
                     }
                 }
@@ -10339,10 +10379,9 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                     */
                     (void)DPCT_CHECK_ERROR(
                         ts->memcpy((uint8_t *)ctx->d_expert_staging + stg_base +
-                                       (size_t)j * stride,
-                                   (uint8_t *)ctx->rcache.buf +
-                                       (size_t)ramhit_slot[j] * stride,
-                                   stride));
+                                    (size_t)j * stride,
+                                ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]),
+                                stride));
                 }
             }
         }
@@ -10402,7 +10441,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             // RAM hits (data in rcache.buf, available immediately)
             for (int j = 0; j < n_ramhit; j++) {
                 cpu_expert_work_t *w = &cpu_work[wi++];
-                w->expert_data = (uint8_t *)ctx->rcache.buf + (size_t)ramhit_slot[j] * stride;
+                w->expert_data = ram_cache_slot_ptr(&ctx->rcache, ramhit_slot[j]);
                 w->score = h_scores_ordered[n_p1 + j];
                 w->gate_type = ctx->gate_type;
                 w->up_type = ctx->up_type;
@@ -11181,19 +11220,23 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
     vram_cache_free(&ctx->ecache);
 
     // Expert RAM cache (v2 module)
-    if (ctx->rcache.buf) {
-        if (ctx->rcache_registered) {
-            (void)0;
-            free(ctx->rcache.buf);
-        } else if (ctx->rcache.pinned) {
-            (void)DPCT_CHECK_ERROR(
-                sycl::free(ctx->rcache.buf, dpct::get_in_order_queue()));
-        } else {
-            free(ctx->rcache.buf);
+    if (ctx->rcache.chunks) {
+    
+        for (int i = 0; i < ctx->rcache.n_chunks; i++) {
+
+            if (!ctx->rcache.chunks[i])
+                continue;
+            
+            if (ctx->rcache.chunk_pinned[i / 64] & ((uint64_t)1 << (i & 63)))
+                (void)DPCT_CHECK_ERROR(sycl::free(ctx->rcache.chunks[i], *ctx->rcache_shared_ctx));
+            
+            else free(ctx->rcache.chunks[i]);
         }
-        ctx->rcache.buf = nullptr;
     }
     ram_cache_free(&ctx->rcache);
+
+    delete ctx->rcache_shared_ctx;
+    ctx->rcache_shared_ctx = NULL;
 
     // Expert FFN buffers
     (void)DPCT_CHECK_ERROR(

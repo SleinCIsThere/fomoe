@@ -24,7 +24,7 @@ else ifdef USE_SYCL
 SYCLCC ?= icpx
 SYCL_ARCH ?= intel_gpu_bmg_g31
 SYCL_CFLAGS = -O2 -fsycl -fsycl-targets=$(SYCL_ARCH) \
-              -Isycl_migrated/include -Iinclude -I/home/n/syclomatic/include \
+              -Isycl_migrated/include -Iinclude -I/home/niels/syclomatic/clang/runtime/dpct-rt/include \
               -DFR_GPU -DFR_SYCL -DQMOE_GPU
 CFLAGS += -DQMOE_GPU -DFR_GPU -DFR_SYCL
 GPU_LDFLAGS = -fsycl -fsycl-targets=$(SYCL_ARCH)
