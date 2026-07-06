@@ -604,7 +604,7 @@ struct gpu_ctx {
     hipStream_t shared_stream;     // SharedFFN compute stream (overlaps with H2D)
     hipEvent_t  batch_event[2];    // sync events between streams
     hipEvent_t  shared_event;      // SharedFFN completion sync
-    sycl::context *rcache_shared_ctx;   // Multi device context
+    sycl::context *shared_ctx;   // Multi device context
 
     // --- Expert FFN buffers (existing) ---
     void  *d_expert_staging;   // 2 * MAX_EXPERTS * MAX_EXPERT_STRIDE (double-buffered)
@@ -4596,6 +4596,11 @@ extern "C" gpu_ctx_t *gpu_init(void) try {
 
     err = dpct::select_device(0);
 
+    if (err != hipSuccess) {
+        fprintf(stderr, "GPU: couldn't initialize device 0\n");
+        return nullptr;
+    }
+
     hipDeviceProp_t props;
     (void)DPCT_CHECK_ERROR(dpct::get_device(0).get_device_info(props));
     fprintf(stderr, "GPU: %s (%zu MB VRAM)\n", props.get_name(),
@@ -4618,53 +4623,10 @@ extern "C" gpu_ctx_t *gpu_init(void) try {
 
     { const char *d = getenv("QMOE_DEBUG"); ctx->debug_level = d ? atoi(d) : 0; }
 
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->stream =
-                                   dpct::get_current_device().create_queue()));
-    // Prime the queue with a throwaway barrier so the first *real* profiled
-    // barrier (in gpu_forward) isn't the queue's first-ever command -- a
-    // barrier with nothing preceding it can come back as a degenerate event
-    // with no backing command, and querying profiling info on that throws.
-    (void)ctx->stream->ext_oneapi_submit_barrier();
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->transfer_stream =
-                                   dpct::get_current_device().create_queue()));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->shared_stream =
-                                   dpct::get_current_device().create_queue()));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->batch_event[0] = new sycl::event()));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->batch_event[1] = new sycl::event()));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->shared_event = new sycl::event()));
+    bool multiDevice = false;
 
-    // Allocate expert FFN intermediate buffers (small, use MAX constants)
-    // NOTE: d_expert_staging allocated in gpu_upload_model with actual expert_stride
-    ctx->d_expert_staging = nullptr;
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->d_expert_ptrs = sycl::malloc_device<void *>(
-                                   MAX_EXPERTS, dpct::get_in_order_queue())));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->d_gate = sycl::malloc_device<float>(
-                                   (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                                   dpct::get_in_order_queue())));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->d_up = sycl::malloc_device<float>(
-                                   (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                                   dpct::get_in_order_queue())));
-    HIP_CHECK(DPCT_CHECK_ERROR(
-        ctx->d_down = sycl::malloc_device<float>(
-            (size_t)MAX_EXPERTS * MAX_N_EMBD, dpct::get_in_order_queue())));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->d_scores = sycl::malloc_device<float>(
-                                   MAX_EXPERTS, dpct::get_in_order_queue())));
-    HIP_CHECK(DPCT_CHECK_ERROR(ctx->d_ffn_out = sycl::malloc_device<float>(
-                                   MAX_N_EMBD, dpct::get_in_order_queue())));
-
-    ctx->ram_cache_mb = -1;  // auto by default
-    ctx->vram_cache_mb = -1; // auto by default
-    ctx->n_devices = 1;
-    ctx->pingpong = false;
-
-    fprintf(stderr, "GPU: expert FFN buffers allocated (GPU 0)\n");
-
-    if (getenv("QMOE_PINGPONG") != NULL && device_count < 2) {
-        fprintf(stderr, "GPU: QMOE_PINGPONG requested but only one GPU is available; ping-pong disabled\n");
-    }
-
-    // ---- GPU1 init (expert engine) ----
     if (device_count >= 2) {
+
         hipDeviceProp_t props1;
         (void)DPCT_CHECK_ERROR(dpct::get_device(1).get_device_info(props1));
         
@@ -4689,111 +4651,152 @@ extern "C" gpu_ctx_t *gpu_init(void) try {
                     "n/a", props1.get_max_compute_units());
 #endif
             ctx->gpu1.device_id = 1;
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.stream = dpct::get_current_device().create_queue()));
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.transfer_stream =
-                    dpct::get_current_device().create_queue()));
-            HIP_CHECK(
-                DPCT_CHECK_ERROR(ctx->gpu1.batch_event[0] = new sycl::event()));
-            HIP_CHECK(
-                DPCT_CHECK_ERROR(ctx->gpu1.batch_event[1] = new sycl::event()));
-            HIP_CHECK(
-                DPCT_CHECK_ERROR(ctx->gpu1.cache_event = new sycl::event()));
 
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.d_expert_ptrs = sycl::malloc_device<void *>(
-                    MAX_EXPERTS, dpct::get_in_order_queue())));
-            HIP_CHECK(
-                DPCT_CHECK_ERROR(ctx->gpu1.d_gate = sycl::malloc_device<float>(
-                                     (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                                     dpct::get_in_order_queue())));
-            HIP_CHECK(
-                DPCT_CHECK_ERROR(ctx->gpu1.d_up = sycl::malloc_device<float>(
-                                     (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                                     dpct::get_in_order_queue())));
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.d_down =
-                    sycl::malloc_device<float>((size_t)MAX_EXPERTS * MAX_N_EMBD,
-                                               dpct::get_in_order_queue())));
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.d_scores = sycl::malloc_device<float>(
-                    MAX_EXPERTS, dpct::get_in_order_queue())));
-            HIP_CHECK(DPCT_CHECK_ERROR(
-                ctx->gpu1.d_ffn_out = sycl::malloc_device<float>(
-                    MAX_N_EMBD, dpct::get_in_order_queue())));
-            ctx->gpu1.d_expert_staging = nullptr;  // allocated in gpu_upload_model
-            ctx->gpu1.d_norm = nullptr;
-            ctx->gpu1.d_partial = nullptr;
-            memset(&ctx->gpu1.ecache, 0, sizeof(ctx->gpu1.ecache));
+            std::vector<sycl::device> devs = {
+                dpct::get_device(0),
+                dpct::get_device(1)
+            };
 
-            ctx->n_devices = 2;
-            fprintf(stderr, "GPU1: expert FFN buffers allocated\n");
-
-            // ---- Ping-pong init: per-device expert FFN buffers ----
-            // Check QMOE_PINGPONG env var to enable ping-pong mode
-            ctx->pingpong = (getenv("QMOE_PINGPONG") != NULL);
-            if (ctx->pingpong) {
-                fprintf(stderr, "GPU: ping-pong mode enabled (even layers GPU0, odd layers GPU1)\n");
-
-                for (int d = 0; d < 2; d++) {
-                    (void)dpct::select_device(d);
-                    gpu_dev_t *dc = &ctx->dev[d];
-                    memset(dc, 0, sizeof(gpu_dev_t));
-                    dc->device_id = d;
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->stream =
-                            dpct::get_current_device().create_queue()));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->transfer_stream =
-                            dpct::get_current_device().create_queue()));
-                    HIP_CHECK(DPCT_CHECK_ERROR(dc->batch_event[0] =
-                                                   new sycl::event()));
-                    HIP_CHECK(DPCT_CHECK_ERROR(dc->batch_event[1] =
-                                                   new sycl::event()));
-                    HIP_CHECK(
-                        DPCT_CHECK_ERROR(dc->spec_event = new sycl::event()));
-                    HIP_CHECK(DPCT_CHECK_ERROR(dc->prefetch_event =
-                                                   new sycl::event()));
-                    dc->prefetch_pending = false;
-
-                    // Expert FFN buffers
-                    dc->d_expert_staging = nullptr;
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_expert_ptrs = sycl::malloc_device<void *>(
-                            MAX_EXPERTS, dpct::get_in_order_queue())));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_gate = sycl::malloc_device<float>(
-                            (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                            dpct::get_in_order_queue())));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_up = sycl::malloc_device<float>(
-                            (size_t)MAX_EXPERTS * MAX_INTERMEDIATE,
-                            dpct::get_in_order_queue())));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_down = sycl::malloc_device<float>(
-                            (size_t)MAX_EXPERTS * MAX_N_EMBD,
-                            dpct::get_in_order_queue())));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_scores = sycl::malloc_device<float>(
-                            MAX_EXPERTS, dpct::get_in_order_queue())));
-                    HIP_CHECK(DPCT_CHECK_ERROR(
-                        dc->d_ffn_out = sycl::malloc_device<float>(
-                            MAX_N_EMBD, dpct::get_in_order_queue())));
-
-                    // Profiling events
-                    for (int i = 0; i < 12; i++) {
-                        HIP_CHECK(DPCT_CHECK_ERROR(dc->prof_e[i] =
-                                                       new sycl::event()));
-                    }
-
-                    fprintf(stderr, "GPU: ping-pong dev[%d] init done\n", d);
-                }
-            }
-
-            // Return to GPU0 as default device
-            (void)dpct::select_device(0);
+            ctx->shared_ctx = new sycl::context(devs);
+            multiDevice = true;
         }
+
+        // Return to GPU0 as default device
+        (void)dpct::select_device(0);
+    }
+    
+    if(!multiDevice)
+        ctx->shared_ctx = new sycl::context(dpct::get_device(0));
+
+    const sycl::property_list inorder_props = {
+        sycl::property::queue::in_order{},
+        sycl::property::queue::enable_profiling{}
+    };
+
+    HIP_CHECK(DPCT_CHECK_ERROR(ctx->stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(0), inorder_props)));
+    // Prime the queue with a throwaway barrier so the first *real* profiled
+    // barrier (in gpu_forward) isn't the queue's first-ever command -- a
+    // barrier with nothing preceding it can come back as a degenerate event
+    // with no backing command, and querying profiling info on that throws.
+    (void)ctx->stream->ext_oneapi_submit_barrier();
+    ctx->transfer_stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(0), inorder_props);
+    ctx->shared_stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(0), inorder_props);
+    HIP_CHECK(DPCT_CHECK_ERROR(ctx->batch_event[0] = new sycl::event()));
+    HIP_CHECK(DPCT_CHECK_ERROR(ctx->batch_event[1] = new sycl::event()));
+    HIP_CHECK(DPCT_CHECK_ERROR(ctx->shared_event = new sycl::event()));
+
+    // Allocate expert FFN intermediate buffers (small, use MAX constants)
+    // NOTE: d_expert_staging allocated in gpu_upload_model with actual expert_stride
+    ctx->d_expert_staging = nullptr;
+    ctx->d_expert_ptrs = sycl::malloc_device<void *>(
+        MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
+    ctx->d_gate = sycl::malloc_device<float>(
+        (size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(0), *ctx->shared_ctx);
+    ctx->d_up = sycl::malloc_device<float>(
+        (size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(0), *ctx->shared_ctx);
+    ctx->d_down = sycl::malloc_device<float>(
+        (size_t)MAX_EXPERTS * MAX_N_EMBD, dpct::get_device(0), *ctx->shared_ctx);
+    ctx->d_scores = sycl::malloc_device<float>(
+        MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
+    ctx->d_ffn_out = sycl::malloc_device<float>(
+        MAX_N_EMBD, dpct::get_device(0), *ctx->shared_ctx);
+
+    ctx->ram_cache_mb = -1;  // auto by default
+    ctx->vram_cache_mb = -1; // auto by default
+    ctx->n_devices = 1;
+    ctx->pingpong = false;
+
+    fprintf(stderr, "GPU: expert FFN buffers allocated (GPU 0)\n");
+
+    if (getenv("QMOE_PINGPONG") != NULL && device_count < 2) {
+        fprintf(stderr, "GPU: QMOE_PINGPONG requested but only one GPU is available; ping-pong disabled\n");
+    }
+
+    // ---- GPU1 init (expert engine) ----
+    if (multiDevice) {
+
+        DPCT_CHECK_ERROR(dpct::select_device(1));
+
+        ctx->gpu1.stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(1), inorder_props);
+        ctx->gpu1.transfer_stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(1), inorder_props);
+        
+        HIP_CHECK(
+            DPCT_CHECK_ERROR(ctx->gpu1.batch_event[0] = new sycl::event()));
+        HIP_CHECK(
+            DPCT_CHECK_ERROR(ctx->gpu1.batch_event[1] = new sycl::event()));
+        HIP_CHECK(
+            DPCT_CHECK_ERROR(ctx->gpu1.cache_event = new sycl::event()));
+
+        ctx->gpu1.d_expert_ptrs = sycl::malloc_device<void *>(MAX_EXPERTS, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_gate = sycl::malloc_device<float>((size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_up = sycl::malloc_device<float>((size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_down = sycl::malloc_device<float>((size_t)MAX_EXPERTS * MAX_N_EMBD, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_scores = sycl::malloc_device<float>(MAX_EXPERTS, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_ffn_out = sycl::malloc_device<float>(MAX_N_EMBD, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_expert_staging = nullptr;  // allocated in gpu_upload_model
+        ctx->gpu1.d_norm = nullptr;
+        ctx->gpu1.d_partial = nullptr;
+        memset(&ctx->gpu1.ecache, 0, sizeof(ctx->gpu1.ecache));
+
+        ctx->n_devices = 2;
+        fprintf(stderr, "GPU1: expert FFN buffers allocated\n");
+
+        // ---- Ping-pong init: per-device expert FFN buffers ----
+        // Check QMOE_PINGPONG env var to enable ping-pong mode
+        ctx->pingpong = (getenv("QMOE_PINGPONG") != NULL);
+        if (ctx->pingpong) {
+            fprintf(stderr, "GPU: ping-pong mode enabled (even layers GPU0, odd layers GPU1)\n");
+
+            for (int d = 0; d < 2; d++) {
+                (void)dpct::select_device(d);
+                gpu_dev_t *dc = &ctx->dev[d];
+                memset(dc, 0, sizeof(gpu_dev_t));
+                dc->device_id = d;
+                dc->stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(d), inorder_props);
+                dc->transfer_stream = new sycl::queue(*ctx->shared_ctx, dpct::get_device(d), inorder_props);
+                HIP_CHECK(DPCT_CHECK_ERROR(dc->batch_event[0] =
+                                                new sycl::event()));
+                HIP_CHECK(DPCT_CHECK_ERROR(dc->batch_event[1] =
+                                                new sycl::event()));
+                HIP_CHECK(
+                    DPCT_CHECK_ERROR(dc->spec_event = new sycl::event()));
+                HIP_CHECK(DPCT_CHECK_ERROR(dc->prefetch_event =
+                                                new sycl::event()));
+                dc->prefetch_pending = false;
+
+                // Expert FFN buffers
+                dc->d_expert_staging = nullptr;
+                
+                dc->d_expert_ptrs = sycl::malloc_device<void *>(
+                    MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
+
+                dc->d_gate = sycl::malloc_device<float>(
+                    (size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(d), *ctx->shared_ctx);
+
+                dc->d_up = sycl::malloc_device<float>(
+                    (size_t)MAX_EXPERTS * MAX_INTERMEDIATE, dpct::get_device(d), *ctx->shared_ctx);
+
+                dc->d_down = sycl::malloc_device<float>(
+                    (size_t)MAX_EXPERTS * MAX_N_EMBD, dpct::get_device(d), *ctx->shared_ctx);
+
+                dc->d_scores = sycl::malloc_device<float>(
+                    MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
+
+                dc->d_ffn_out = sycl::malloc_device<float>(
+                    MAX_N_EMBD, dpct::get_device(d), *ctx->shared_ctx);
+
+                // Profiling events
+                for (int i = 0; i < 12; i++) {
+                    HIP_CHECK(DPCT_CHECK_ERROR(dc->prof_e[i] =
+                                                    new sycl::event()));
+                }
+
+                fprintf(stderr, "GPU: ping-pong dev[%d] init done\n", d);
+            }
+        }
+
+        // Return to GPU0 as default device
+        (void)dpct::select_device(0);
     }
 
     return ctx;
@@ -4916,11 +4919,9 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                                 max_slots, ctx->expert_stride) == 0) {
                 max_slots = ctx->ecache.max_slots;
                 size_t alloc_sz = (size_t)max_slots * ctx->expert_stride;
-                hipError_t err = DPCT_CHECK_ERROR(
-                    ctx->ecache.d_buf = (void *)sycl::malloc_device(
-                        alloc_sz, dpct::get_in_order_queue()));
+                ctx->ecache.d_buf = (void *)sycl::malloc_device(alloc_sz, dpct::get_device(0), *ctx->shared_ctx);
 
-                if (err != hipSuccess) {
+                if (!ctx->ecache.d_buf) {
                     fprintf(stderr, "GPU: expert cache alloc failed, disabling\n");
                     vram_cache_free(&ctx->ecache);
                 } else {
@@ -4966,9 +4967,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
 #ifdef QMOE_CUDA
             *d_type = type;
             *d_bytes = (size_t)M * (size_t)K * sizeof(uint16_t);
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(*d_dst = (void *)sycl::malloc_device(
-                                     *d_bytes, dpct::get_in_order_queue())));
+            *d_dst = (void *)sycl::malloc_device(*d_bytes, dpct::get_current_device(), *ctx->shared_ctx);
             return upload_bytes(src, *d_dst, *d_bytes);
 #else
             if (!allow_fp_upcast) {
@@ -4989,7 +4988,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             }
             *d_type = GGML_TYPE_F32;
             *d_bytes = n * sizeof(float);
-            HIP_CHECK_I(DPCT_CHECK_ERROR(*d_dst = (void *)sycl::malloc_device(*d_bytes, dpct::get_in_order_queue())));
+            *d_dst = (void *)sycl::malloc_device(*d_bytes, dpct::get_current_device(), *ctx->shared_ctx);
             int rc = upload_bytes(tmp, *d_dst, *d_bytes);
             free(tmp);
             return rc;
@@ -5012,9 +5011,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         } else {
             *d_bytes = (size_t)M * (size_t)K * sizeof(float);
         }
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(*d_dst = (void *)sycl::malloc_device(
-                                 *d_bytes, dpct::get_in_order_queue())));
+        *d_dst = (void *)sycl::malloc_device(*d_bytes, dpct::get_current_device(), *ctx->shared_ctx);
         return upload_bytes(src, *d_dst, *d_bytes);
     };
 
@@ -5032,9 +5029,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         {
             size_t sz = hp->n_embd * sizeof(float);
             fprintf(stderr, "GPU:   upload output_norm (%.2f KB)\n", (double)sz / 1024.0);
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_output_norm = (float *)sycl::malloc_device(
-                    sz, dpct::get_in_order_queue())));
+            ctx->d_output_norm = (float *)sycl::malloc_device(sz, dpct::get_device(0), *ctx->shared_ctx);
             HIP_CHECK_I(DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
                     .memcpy(ctx->d_output_norm, m->output_norm, sz)
@@ -5088,8 +5083,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     // Helper: upload f32 buffer
     auto upload_f32 = [&](const float *src, float **d_dst, size_t n) -> int {
         size_t sz = n * sizeof(float);
-        HIP_CHECK_I(DPCT_CHECK_ERROR(*d_dst = (float *)sycl::malloc_device(
-                                         sz, dpct::get_in_order_queue())));
+        *d_dst = (float *)sycl::malloc_device(sz, dpct::get_current_device(), *ctx->shared_ctx);
         if (upload_bytes(src, *d_dst, sz) != 0) return -1;
         return 0;
     };
@@ -5105,20 +5099,14 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         size_t norm_sz = hp->n_embd * sizeof(float);
 
         // Common weights: attn_norm, ffn_norm, router
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(gl->d_attn_norm = (float *)sycl::malloc_device(
-                                 norm_sz, dpct::get_in_order_queue())));
+        gl->d_attn_norm = (float *)sycl::malloc_device(norm_sz, dpct::get_current_device(), *ctx->shared_ctx);
         if (upload_bytes(l->attn_norm, gl->d_attn_norm, norm_sz) != 0) return -1;
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(gl->d_ffn_norm = (float *)sycl::malloc_device(
-                                 norm_sz, dpct::get_in_order_queue())));
+        gl->d_ffn_norm = (float *)sycl::malloc_device(norm_sz, dpct::get_current_device(), *ctx->shared_ctx);
         if (upload_bytes(l->ffn_norm, gl->d_ffn_norm, norm_sz) != 0) return -1;
         total_uploaded += 2 * norm_sz;
 
         size_t router_sz = (size_t)hp->n_experts * hp->n_embd * sizeof(float);
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(gl->d_router = (float *)sycl::malloc_device(
-                                 router_sz, dpct::get_in_order_queue())));
+        gl->d_router = (float *)sycl::malloc_device(router_sz, dpct::get_current_device(), *ctx->shared_ctx);
         if (upload_bytes(l->router, gl->d_router, router_sz) != 0) return -1;
         total_uploaded += router_sz;
 
@@ -5212,12 +5200,8 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         size_t kv_layer_bytes =
             (size_t)ctx->ctx_len * kv_dim * sizeof(sycl::half);
         size_t kv_total = (size_t)n_full_attn * kv_layer_bytes;
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_kv_k = (sycl::half *)sycl::malloc_device(
-                                 kv_total, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_kv_v = (sycl::half *)sycl::malloc_device(
-                                 kv_total, dpct::get_in_order_queue())));
+        ctx->d_kv_k = (sycl::half *)sycl::malloc_device(kv_total, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_kv_v = (sycl::half *)sycl::malloc_device(kv_total, dpct::get_device(0), *ctx->shared_ctx);
         HIP_CHECK_I(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
                                          .memset(ctx->d_kv_k, 0, kv_total)
                                          .wait()));
@@ -5232,9 +5216,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             size_t state_per_layer = (size_t)hp->ssm_time_step_rank * hp->ssm_state_size *
                                       hp->ssm_value_dim * sizeof(float);
             size_t state_total = (size_t)n_ssm * state_per_layer;
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_ssm_states = (float *)sycl::malloc_device(
-                    state_total, dpct::get_in_order_queue())));
+            ctx->d_ssm_states = (float *)sycl::malloc_device(state_total, dpct::get_device(0), *ctx->shared_ctx);
             HIP_CHECK_I(
                 DPCT_CHECK_ERROR(dpct::get_in_order_queue()
                                      .memset(ctx->d_ssm_states, 0, state_total)
@@ -5243,17 +5225,13 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             int conv_steps = hp->ssm_conv_kernel - 1;
             size_t conv_per_layer = (size_t)conv_steps * hp->ssm_qkv_dim * sizeof(float);
             size_t conv_total = (size_t)n_ssm * conv_per_layer;
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_ssm_conv_bufs = (float *)sycl::malloc_device(
-                    conv_total, dpct::get_in_order_queue())));
+            ctx->d_ssm_conv_bufs = (float *)sycl::malloc_device(conv_total, dpct::get_device(0), *ctx->shared_ctx);
             HIP_CHECK_I(DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
                     .memset(ctx->d_ssm_conv_bufs, 0, conv_total)
                     .wait()));
 
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(ctx->d_ssm_conv_pos = sycl::malloc_device<int>(
-                                     n_ssm, dpct::get_in_order_queue())));
+            ctx->d_ssm_conv_pos = sycl::malloc_device<int>(n_ssm, dpct::get_device(0), *ctx->shared_ctx);
             HIP_CHECK_I(DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
                     .memset(ctx->d_ssm_conv_pos, 0, n_ssm * sizeof(int))
@@ -5280,77 +5258,33 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         size_t attn_size = hp->n_heads * hp->head_dim;
         if (hp->ssm_inner_size > attn_size) attn_size = hp->ssm_inner_size;
 
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_x = sycl::malloc_device<float>(
-                                 hp->n_embd, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_norm = sycl::malloc_device<float>(
-                                 hp->n_embd, dpct::get_in_order_queue())));
-        HIP_CHECK_I(DPCT_CHECK_ERROR(ctx->d_q = sycl::malloc_device<float>(
-                                         q_size, dpct::get_in_order_queue())));
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_k = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim,
-                                                  dpct::get_in_order_queue())));
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_v = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim,
-                                                  dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_attn_out = sycl::malloc_device<float>(
-                                 attn_size, dpct::get_in_order_queue())));
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_attn_scores =
-                sycl::malloc_device<float>((size_t)hp->n_heads * ctx->ctx_len,
-                                           dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_attn_gate_buf = sycl::malloc_device<float>(
-                                 attn_size, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_router_out = sycl::malloc_device<float>(
-                                 hp->n_experts, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_ffn_buf = sycl::malloc_device<float>(
-                                 hp->n_embd, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_logits = sycl::malloc_device<float>(
-                                 hp->vocab_size, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_top_k_ids = sycl::malloc_device<int>(
-                                 MAX_EXPERTS, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_top_k_vals = sycl::malloc_device<float>(
-                                 MAX_EXPERTS, dpct::get_in_order_queue())));
+        ctx->d_x = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_norm = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_q = sycl::malloc_device<float>(q_size, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_k = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_v = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_attn_out = sycl::malloc_device<float>(attn_size, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_attn_scores = sycl::malloc_device<float>((size_t)hp->n_heads * ctx->ctx_len, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_attn_gate_buf = sycl::malloc_device<float>(attn_size, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_router_out = sycl::malloc_device<float>(hp->n_experts, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_ffn_buf = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_logits = sycl::malloc_device<float>(hp->vocab_size, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_top_k_ids = sycl::malloc_device<int>(MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_top_k_vals = sycl::malloc_device<float>(MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
 
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_spec_router_out = sycl::malloc_device<float>(
-                hp->n_experts, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_spec_top_k_ids = sycl::malloc_device<int>(
-                                 MAX_EXPERTS, dpct::get_in_order_queue())));
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_spec_top_k_vals = sycl::malloc_device<float>(
-                MAX_EXPERTS, dpct::get_in_order_queue())));
+        ctx->d_spec_router_out = sycl::malloc_device<float>(hp->n_experts, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_spec_top_k_ids = sycl::malloc_device<int>(MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
+        ctx->d_spec_top_k_vals = sycl::malloc_device<float>(MAX_EXPERTS, dpct::get_device(0), *ctx->shared_ctx);
 
         if (n_ssm > 0) {
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_ssm_dt = sycl::malloc_device<float>(
-                    hp->ssm_time_step_rank, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_ssm_beta_buf = sycl::malloc_device<float>(
-                    hp->ssm_time_step_rank, dpct::get_in_order_queue())));
+            ctx->d_ssm_dt = sycl::malloc_device<float>(hp->ssm_time_step_rank, dpct::get_device(0), *ctx->shared_ctx);
+            ctx->d_ssm_beta_buf = sycl::malloc_device<float>(hp->ssm_time_step_rank, dpct::get_device(0), *ctx->shared_ctx);
         }
 
         if (hp->has_shared_expert) {
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_shared_gate_buf =
-                    sycl::malloc_device<float>(hp->shared_expert_intermediate,
-                                               dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_shared_up_buf =
-                    sycl::malloc_device<float>(hp->shared_expert_intermediate,
-                                               dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_shared_down_buf = sycl::malloc_device<float>(
-                    hp->n_embd, dpct::get_in_order_queue())));
+            ctx->d_shared_gate_buf = sycl::malloc_device<float>(hp->shared_expert_intermediate, dpct::get_device(0), *ctx->shared_ctx);
+            ctx->d_shared_up_buf = sycl::malloc_device<float>(hp->shared_expert_intermediate, dpct::get_device(0), *ctx->shared_ctx);
+            ctx->d_shared_down_buf = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(0), *ctx->shared_ctx);
         }
 
         {
@@ -5359,12 +5293,8 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             if ((size_t)(hp->n_heads * hp->head_dim) > max_input)
                 max_input = hp->n_heads * hp->head_dim;
             max_input = ((max_input + 31) / 32) * 32;
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(ctx->d_input_q8 = sycl::malloc_device<int8_t>(
-                                     max_input, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                ctx->d_input_q8_scales = sycl::malloc_device<float>(
-                    (max_input / 32), dpct::get_in_order_queue())));
+            ctx->d_input_q8 = sycl::malloc_device<int8_t>(max_input, dpct::get_device(0), *ctx->shared_ctx);
+            ctx->d_input_q8_scales = sycl::malloc_device<float>((max_input / 32), dpct::get_device(0), *ctx->shared_ctx);
         }
     }
 
@@ -5386,9 +5316,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     // Skip in ping-pong: per-device staging allocated later.
     if (!ctx->pingpong) {
         size_t staging_size = (size_t)ctx->n_experts_used * 2 * ctx->expert_stride;
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->d_expert_staging = (void *)sycl::malloc_device(
-                staging_size, dpct::get_in_order_queue())));
+        ctx->d_expert_staging = (void *)sycl::malloc_device(staging_size, dpct::get_device(0), *ctx->shared_ctx);
         fprintf(stderr, "GPU: expert staging: %.1f MB (2×%d slots × %.2f MB stride)\n",
                 (double)staging_size / (1024.0 * 1024.0),
                 ctx->n_experts_used,
@@ -5405,19 +5333,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
 
         // Expert staging (same size as GPU0)
         size_t staging_size = (size_t)ctx->n_experts_used * 2 * ctx->expert_stride;
-        HIP_CHECK_I(DPCT_CHECK_ERROR(
-            ctx->gpu1.d_expert_staging = (void *)sycl::malloc_device(
-                staging_size, dpct::get_in_order_queue())));
+        ctx->gpu1.d_expert_staging = (void *)sycl::malloc_device(
+            staging_size, dpct::get_device(1), *ctx->shared_ctx);
         fprintf(stderr, "GPU1: expert staging: %.1f MB\n",
                 (double)staging_size / (1024.0 * 1024.0));
 
         // Input/output scratch
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->gpu1.d_norm = sycl::malloc_device<float>(
-                                 ctx->n_embd, dpct::get_in_order_queue())));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->gpu1.d_partial = sycl::malloc_device<float>(
-                                 ctx->n_embd, dpct::get_in_order_queue())));
+        ctx->gpu1.d_norm = sycl::malloc_device<float>(
+            ctx->n_embd, dpct::get_device(1), *ctx->shared_ctx);
+        ctx->gpu1.d_partial = sycl::malloc_device<float>(
+            ctx->n_embd, dpct::get_device(1), *ctx->shared_ctx);
 
         // VRAM expert cache — GPU1 has almost no weights, so nearly all VRAM is cache
         {
@@ -5437,11 +5362,10 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                                     max_slots, ctx->expert_stride) == 0) {
                     max_slots = ctx->gpu1.ecache.max_slots;
                     size_t alloc_sz = (size_t)max_slots * ctx->expert_stride;
-                    hipError_t err = DPCT_CHECK_ERROR(
-                        ctx->gpu1.ecache.d_buf = (void *)sycl::malloc_device(
-                            alloc_sz, dpct::get_in_order_queue()));
+                    ctx->gpu1.ecache.d_buf = (void *)sycl::malloc_device(
+                        alloc_sz, dpct::get_device(1), *ctx->shared_ctx);
 
-                    if (err != hipSuccess) {
+                    if (!ctx->gpu1.ecache.d_buf) {
                         fprintf(stderr, "GPU1: expert cache alloc failed, disabling\n");
                         vram_cache_free(&ctx->gpu1.ecache);
                     } else {
@@ -5468,11 +5392,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
 
     // Inter-GPU pinned staging (needed for both expert-split and ping-pong relay)
     if (ctx->n_devices >= 2) {
-        HIP_CHECK_I(hipHostMalloc(&ctx->h_gpu1_norm, ctx->n_embd * sizeof(float), hipHostMallocDefault));
-        HIP_CHECK_I(hipHostMalloc(&ctx->h_gpu1_partial, ctx->n_embd * sizeof(float), hipHostMallocDefault));
-        HIP_CHECK_I(
-            DPCT_CHECK_ERROR(ctx->d_gpu1_partial = sycl::malloc_device<float>(
-                                 ctx->n_embd, dpct::get_in_order_queue())));
+
+        ctx->h_gpu1_norm    = (float*)sycl::malloc_host(ctx->n_embd * sizeof(float), *ctx->shared_ctx);
+        ctx->h_gpu1_partial = (float*)sycl::malloc_host(ctx->n_embd * sizeof(float), *ctx->shared_ctx);
+        if (!ctx->h_gpu1_norm || !ctx->h_gpu1_partial) {
+            fprintf(stderr, "GPU: failed to allocate relay staging buffers\n");
+            return -1;
+        }
+
+        ctx->d_gpu1_partial = sycl::malloc_device<float>(
+            ctx->n_embd, dpct::get_device(0), *ctx->shared_ctx);
     } else {
         ctx->h_gpu1_norm = nullptr;
         ctx->h_gpu1_partial = nullptr;
@@ -5513,85 +5442,38 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             }
 
             // Scratch buffers
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_x = sycl::malloc_device<float>(
-                                     hp->n_embd, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_norm = sycl::malloc_device<float>(
-                                     hp->n_embd, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_q = sycl::malloc_device<float>(
-                                     q_size, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(dc->d_k = sycl::malloc_device<float>(
-                                             hp->n_kv_heads * hp->head_dim,
-                                             dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(dc->d_v = sycl::malloc_device<float>(
-                                             hp->n_kv_heads * hp->head_dim,
-                                             dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_attn_out = sycl::malloc_device<float>(
-                                     attn_size, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_attn_scores = sycl::malloc_device<float>(
-                                     (size_t)hp->n_heads * ctx->ctx_len,
-                                     dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_attn_gate_buf = sycl::malloc_device<float>(
-                    attn_size, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_router_out = sycl::malloc_device<float>(
-                    hp->n_experts, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_ffn_buf = sycl::malloc_device<float>(
-                                     hp->n_embd, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_top_k_ids = sycl::malloc_device<int>(
-                                     MAX_EXPERTS, dpct::get_in_order_queue())));
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_top_k_vals = sycl::malloc_device<float>(
-                                     MAX_EXPERTS, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_spec_router_out = sycl::malloc_device<float>(
-                    hp->n_experts, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_spec_top_k_ids = sycl::malloc_device<int>(
-                    MAX_EXPERTS, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_spec_top_k_vals = sycl::malloc_device<float>(
-                    MAX_EXPERTS, dpct::get_in_order_queue())));
+            dc->d_x = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_norm = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_q = sycl::malloc_device<float>(q_size, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_k = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_v = sycl::malloc_device<float>(hp->n_kv_heads * hp->head_dim, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_attn_out = sycl::malloc_device<float>(attn_size, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_attn_scores = sycl::malloc_device<float>((size_t)hp->n_heads * ctx->ctx_len, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_attn_gate_buf = sycl::malloc_device<float>(attn_size, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_router_out = sycl::malloc_device<float>(hp->n_experts, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_ffn_buf = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_top_k_ids = sycl::malloc_device<int>(MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_top_k_vals = sycl::malloc_device<float>(MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_spec_router_out = sycl::malloc_device<float>(hp->n_experts, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_spec_top_k_ids = sycl::malloc_device<int>(MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_spec_top_k_vals = sycl::malloc_device<float>(MAX_EXPERTS, dpct::get_device(d), *ctx->shared_ctx);
 
             // SSM scratch
             if (dc->n_ssm_layers > 0) {
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_ssm_dt = sycl::malloc_device<float>(
-                        hp->ssm_time_step_rank, dpct::get_in_order_queue())));
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_ssm_beta_buf = sycl::malloc_device<float>(
-                        hp->ssm_time_step_rank, dpct::get_in_order_queue())));
+                dc->d_ssm_dt = sycl::malloc_device<float>(hp->ssm_time_step_rank, dpct::get_device(d), *ctx->shared_ctx);
+                dc->d_ssm_beta_buf = sycl::malloc_device<float>(hp->ssm_time_step_rank, dpct::get_device(d), *ctx->shared_ctx);
             }
 
             // Shared expert scratch
             if (hp->has_shared_expert) {
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_shared_gate_buf = sycl::malloc_device<float>(
-                        hp->shared_expert_intermediate,
-                        dpct::get_in_order_queue())));
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_shared_up_buf = sycl::malloc_device<float>(
-                        hp->shared_expert_intermediate,
-                        dpct::get_in_order_queue())));
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_shared_down_buf = sycl::malloc_device<float>(
-                        hp->n_embd, dpct::get_in_order_queue())));
+                dc->d_shared_gate_buf = sycl::malloc_device<float>(hp->shared_expert_intermediate, dpct::get_device(d), *ctx->shared_ctx);
+                dc->d_shared_up_buf = sycl::malloc_device<float>(hp->shared_expert_intermediate, dpct::get_device(d), *ctx->shared_ctx);
+                dc->d_shared_down_buf = sycl::malloc_device<float>(hp->n_embd, dpct::get_device(d), *ctx->shared_ctx);
             }
 
             // Pre-quantized input buffers
-            HIP_CHECK_I(
-                DPCT_CHECK_ERROR(dc->d_input_q8 = sycl::malloc_device<int8_t>(
-                                     max_input, dpct::get_in_order_queue())));
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                dc->d_input_q8_scales = sycl::malloc_device<float>(
-                    (max_input / 32), dpct::get_in_order_queue())));
+            dc->d_input_q8 = sycl::malloc_device<int8_t>(max_input, dpct::get_device(d), *ctx->shared_ctx);
+            dc->d_input_q8_scales = sycl::malloc_device<float>((max_input / 32), dpct::get_device(d), *ctx->shared_ctx);
 
             // KV cache (this device's full-attention layers only)
             if (dc->n_full_attn > 0) {
@@ -5606,12 +5488,8 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                 size_t kv_layer_bytes =
                     (size_t)ctx->ctx_len * kv_dim * sizeof(sycl::half);
                 size_t kv_total = (size_t)dc->n_full_attn * kv_layer_bytes;
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_kv_k = (sycl::half *)sycl::malloc_device(
-                        kv_total, dpct::get_in_order_queue())));
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_kv_v = (sycl::half *)sycl::malloc_device(
-                        kv_total, dpct::get_in_order_queue())));
+                dc->d_kv_k = (sycl::half *)sycl::malloc_device(kv_total, dpct::get_device(d), *ctx->shared_ctx);
+                dc->d_kv_v = (sycl::half *)sycl::malloc_device(kv_total, dpct::get_device(d), *ctx->shared_ctx);
                 HIP_CHECK_I(
                     DPCT_CHECK_ERROR(dpct::get_in_order_queue()
                                          .memset(dc->d_kv_k, 0, kv_total)
@@ -5636,9 +5514,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                 size_t state_per_layer = (size_t)hp->ssm_time_step_rank * hp->ssm_state_size *
                                           hp->ssm_value_dim * sizeof(float);
                 size_t state_total = (size_t)dc->n_ssm_layers * state_per_layer;
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_ssm_states = (float *)sycl::malloc_device(
-                        state_total, dpct::get_in_order_queue())));
+                dc->d_ssm_states = (float *)sycl::malloc_device(state_total, dpct::get_device(d), *ctx->shared_ctx);
                 HIP_CHECK_I(DPCT_CHECK_ERROR(
                     dpct::get_in_order_queue()
                         .memset(dc->d_ssm_states, 0, state_total)
@@ -5647,17 +5523,13 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                 int conv_steps = hp->ssm_conv_kernel - 1;
                 size_t conv_per_layer = (size_t)conv_steps * hp->ssm_qkv_dim * sizeof(float);
                 size_t conv_total = (size_t)dc->n_ssm_layers * conv_per_layer;
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_ssm_conv_bufs = (float *)sycl::malloc_device(
-                        conv_total, dpct::get_in_order_queue())));
+                dc->d_ssm_conv_bufs = (float *)sycl::malloc_device(conv_total, dpct::get_device(d), *ctx->shared_ctx);
                 HIP_CHECK_I(DPCT_CHECK_ERROR(
                     dpct::get_in_order_queue()
                         .memset(dc->d_ssm_conv_bufs, 0, conv_total)
                         .wait()));
 
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_ssm_conv_pos = sycl::malloc_device<int>(
-                        dc->n_ssm_layers, dpct::get_in_order_queue())));
+                dc->d_ssm_conv_pos = sycl::malloc_device<int>(dc->n_ssm_layers, dpct::get_device(d), *ctx->shared_ctx);
                 HIP_CHECK_I(
                     DPCT_CHECK_ERROR(dpct::get_in_order_queue()
                                          .memset(dc->d_ssm_conv_pos, 0,
@@ -5673,9 +5545,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
             // Expert staging
             {
                 size_t staging_size = (size_t)ctx->n_experts_used * 2 * ctx->expert_stride;
-                HIP_CHECK_I(DPCT_CHECK_ERROR(
-                    dc->d_expert_staging = (void *)sycl::malloc_device(
-                        staging_size, dpct::get_in_order_queue())));
+                dc->d_expert_staging = (void *)sycl::malloc_device(staging_size, dpct::get_device(d), *ctx->shared_ctx);
                 fprintf(stderr, "GPU: dev[%d] expert staging: %.1f MB\n",
                         d, (double)staging_size / (1024.0 * 1024.0));
             }
@@ -5703,9 +5573,8 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
 
             // Output norm
             size_t norm_sz = hp->n_embd * sizeof(float);
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                last_dc->d_output_norm = (float *)sycl::malloc_device(
-                    norm_sz, dpct::get_in_order_queue())));
+            last_dc->d_output_norm = (float *)sycl::malloc_device(norm_sz, dpct::get_device(last_d), *ctx->shared_ctx);
+
             HIP_CHECK_I(DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
                     .memcpy(last_dc->d_output_norm, m_pp->output_norm, norm_sz)
@@ -5732,9 +5601,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                               &last_dc->d_output, &last_dc->output_type, &ignored) != 0) return -1;
 
             // Logits buffer + pinned host
-            HIP_CHECK_I(DPCT_CHECK_ERROR(
-                last_dc->d_logits = sycl::malloc_device<float>(
-                    hp->vocab_size, dpct::get_in_order_queue())));
+            last_dc->d_logits = sycl::malloc_device<float>(hp->vocab_size, dpct::get_device(last_d), *ctx->shared_ctx);
             HIP_CHECK_I(hipHostMalloc(&last_dc->h_logits, hp->vocab_size * sizeof(float)));
 
             fprintf(stderr, "GPU: ping-pong LM head on dev[%d] (%.1f MB)\n",
@@ -5745,43 +5612,19 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         // on the correct GPU via hipSetDevice(i & 1).
         // Free gpu_create_context expert FFN buffers (unused in pingpong)
         (void)dpct::select_device(0);
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_gate, dpct::get_in_order_queue()));
-            ctx->d_gate = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_up, dpct::get_in_order_queue()));
-            ctx->d_up = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_down, dpct::get_in_order_queue()));
-            ctx->d_down = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_expert_ptrs, dpct::get_in_order_queue()));
-            ctx->d_expert_ptrs = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_scores, dpct::get_in_order_queue()));
-            ctx->d_scores = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->d_ffn_out, dpct::get_in_order_queue()));
-            ctx->d_ffn_out = nullptr;
+        sycl::free(ctx->d_gate,        *ctx->shared_ctx); ctx->d_gate        = nullptr;
+        sycl::free(ctx->d_up,          *ctx->shared_ctx); ctx->d_up          = nullptr;
+        sycl::free(ctx->d_down,        *ctx->shared_ctx); ctx->d_down        = nullptr;
+        sycl::free(ctx->d_expert_ptrs, *ctx->shared_ctx); ctx->d_expert_ptrs = nullptr;
+        sycl::free(ctx->d_scores,      *ctx->shared_ctx); ctx->d_scores      = nullptr;
+        sycl::free(ctx->d_ffn_out,     *ctx->shared_ctx); ctx->d_ffn_out     = nullptr;
         (void)dpct::select_device(1);
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_gate, dpct::get_in_order_queue()));
-            ctx->gpu1.d_gate = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_up, dpct::get_in_order_queue()));
-            ctx->gpu1.d_up = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_down, dpct::get_in_order_queue()));
-            ctx->gpu1.d_down = nullptr;
-        (void)DPCT_CHECK_ERROR(dpct::dpct_free(ctx->gpu1.d_expert_ptrs,
-                                               dpct::get_in_order_queue()));
-            ctx->gpu1.d_expert_ptrs = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_scores, dpct::get_in_order_queue()));
-            ctx->gpu1.d_scores = nullptr;
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_ffn_out, dpct::get_in_order_queue()));
-            ctx->gpu1.d_ffn_out = nullptr;
+        sycl::free(ctx->gpu1.d_gate,        *ctx->shared_ctx); ctx->gpu1.d_gate        = nullptr;
+        sycl::free(ctx->gpu1.d_up,          *ctx->shared_ctx); ctx->gpu1.d_up          = nullptr;
+        sycl::free(ctx->gpu1.d_down,        *ctx->shared_ctx); ctx->gpu1.d_down        = nullptr;
+        sycl::free(ctx->gpu1.d_expert_ptrs, *ctx->shared_ctx); ctx->gpu1.d_expert_ptrs = nullptr;
+        sycl::free(ctx->gpu1.d_scores,      *ctx->shared_ctx); ctx->gpu1.d_scores      = nullptr;
+        sycl::free(ctx->gpu1.d_ffn_out,     *ctx->shared_ctx); ctx->gpu1.d_ffn_out     = nullptr;
         (void)dpct::select_device(0);
 
         // Allocate VRAM cache for each device (no fragmentation from migration)
@@ -5812,11 +5655,9 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                                     max_slots, ctx->expert_stride) == 0) {
                     max_slots = dc->ecache.max_slots;
                     size_t alloc_sz = (size_t)max_slots * ctx->expert_stride;
-                    hipError_t cerr = DPCT_CHECK_ERROR(
-                        dc->ecache.d_buf = (void *)sycl::malloc_device(
-                            alloc_sz, dpct::get_in_order_queue()));
+                    dc->ecache.d_buf = (void *)sycl::malloc_device(alloc_sz, dpct::get_device(d), *ctx->shared_ctx);
 
-                    if (cerr != hipSuccess) {
+                    if (!dc->ecache.d_buf) {
                         fprintf(stderr, "GPU: dev[%d] VRAM cache alloc failed\n", d);
                         vram_cache_free(&dc->ecache);
                     } else {
@@ -5934,19 +5775,12 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                     fprintf(stderr, "GPU: RAM cache: Clamped to %u chunks\n", unsigned(sizeof(chunk_pinned) * 8));
                 }
 
-                std::vector<sycl::device> devs = { dpct::get_in_order_queue().get_device() };
-
-                if (ctx->pingpong && ctx->gpu1.device_id >= 0)
-                    devs.push_back(dpct::get_device(ctx->gpu1.device_id));
-
-                ctx->rcache_shared_ctx = new sycl::context(devs);
-
                 for (int i = 0; i < n_chunks; i++) {
                     uint64_t this_sz = (i < n_chunks - 1)
                         ? chunk_sz
                         : (alloc_sz - (uint64_t)(n_chunks - 1) * chunk_sz);
 
-                    chunks[i] = sycl::malloc_host(this_sz, *ctx->rcache_shared_ctx);
+                    chunks[i] = sycl::malloc_host(this_sz, *ctx->shared_ctx);
 
                     if (chunks[i]) {
                         chunk_pinned[i / 64] |= (uint64_t)1 << (i & 63);
@@ -5994,7 +5828,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
                             continue;
 
                         if (chunk_pinned[i / 64] & ((uint64_t)1 << (i & 63)))
-                            (void)DPCT_CHECK_ERROR(sycl::free(chunks[i], *ctx->rcache_shared_ctx));
+                            (void)DPCT_CHECK_ERROR(sycl::free(chunks[i], *ctx->shared_ctx));
 
                         else free(chunks[i]);
                     }
@@ -6012,11 +5846,13 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     // (single-GPU gpu_forward has no equivalent stream-wait before backfill eviction)
     if (ctx->rcache.max_slots > 0 && (!ctx->rcache.pinned || !ctx->pingpong)) {
         size_t bounce_sz = (size_t)ctx->n_experts_used * ctx->expert_stride;
-        hipError_t err = hipHostMalloc(&ctx->h2d_bounce, bounce_sz, hipHostMallocDefault);
-        if (err == hipSuccess) {
+        ctx->h2d_bounce = sycl::malloc_host(bounce_sz, *ctx->shared_ctx);
+        if (ctx->h2d_bounce) {
             ctx->h2d_bounce_slots = ctx->n_experts_used;
-            fprintf(stderr, "GPU: H2D bounce buffer: %.1f MB pinned (%d slots)\n",
-                    (double)bounce_sz / (1024.0 * 1024.0), ctx->n_experts_used);
+            fprintf(stderr, "GPU: h2d bounce buffer: %.1f MB (pinned, shared ctx)\n",
+                    (double)bounce_sz / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "GPU: h2d bounce buffer: allocation failed\n");
         }
     }
 
@@ -6265,10 +6101,8 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
     {
         hipError_t e1 = hipHostMalloc(&ctx->h_norm, ctx->n_embd * sizeof(float), hipHostMallocDefault);
         hipError_t e2 = hipHostMalloc(&ctx->h_cpu_partial, ctx->n_embd * sizeof(float), hipHostMallocDefault);
-        hipError_t e3 =
-            DPCT_CHECK_ERROR(ctx->d_cpu_partial = sycl::malloc_device<float>(
-                                 ctx->n_embd, dpct::get_in_order_queue()));
-        if (e1 == hipSuccess && e2 == hipSuccess && e3 == hipSuccess) {
+        ctx->d_cpu_partial = sycl::malloc_device<float>(ctx->n_embd, dpct::get_device(0), *ctx->shared_ctx);
+        if (e1 == hipSuccess && e2 == hipSuccess && ctx->d_cpu_partial) {
             ctx->cpu_expert = cpu_expert_create(ctx->n_embd, ctx->expert_intermediate);
             if (ctx->cpu_expert)
                 fprintf(stderr, "GPU: CPU expert compute enabled (n_embd=%d, inter=%d)\n",
@@ -6278,15 +6112,15 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) try {
         } else {
             fprintf(stderr, "GPU: WARNING: CPU expert buffer alloc failed\n");
             if (ctx->h_norm) {
-                sycl::free(ctx->h_norm, dpct::get_in_order_queue());
+                sycl::free(ctx->h_norm,       *ctx->shared_ctx);
                 ctx->h_norm = nullptr;
             }
             if (ctx->h_cpu_partial) {
-                sycl::free(ctx->h_cpu_partial, dpct::get_in_order_queue());
+                sycl::free(ctx->h_cpu_partial,*ctx->shared_ctx);
                 ctx->h_cpu_partial = nullptr;
             }
             if (ctx->d_cpu_partial) {
-                dpct::dpct_free(ctx->d_cpu_partial, dpct::get_in_order_queue());
+                sycl::free(ctx->d_cpu_partial,*ctx->shared_ctx);
                 ctx->d_cpu_partial = nullptr;
             }
         }
@@ -8906,32 +8740,17 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
             ctx->prof.pp_total_relay_dma_bytes += relay_bytes * 2;
 
             // D2H: device d -> pinned host relay buffer.
-            //
-            // BUG FIX (cross-device event / CAT fault):
-            // The original code recorded dc->batch_event on device-d's stream,
-            // then submitted ext_oneapi_submit_barrier({*dc->batch_event}) on
-            // next_dc->stream (device-(1-d)).  Intel Level Zero assigns every
-            // sycl::queue its own ZeContext; a ZeEvent from one context cannot
-            // be referenced by a command-list in a different context.  The driver
-            // places the raw event VA (e.g. 0x0000c001fe780000) directly into
-            // the other GPU's command stream as a semaphore address; when the CCS
-            // engine executes the wait it triggers an IOMMU fault → CAT error
-            // [18] → engine reset → ZE_RESULT_ERROR_DEVICE_LOST.
-            //
-            // Fix: CPU-side sync via s->wait().  This adds ~5–15 µs per relay
-            // (PCIe3 x1 round-trip latency) which is the same order as the
-            // hardware event path anyway.  A zero-CPU-overhead solution would
-            // require creating both queues with a shared sycl::context spanning
-            // both devices — left as a future optimisation.
+            // CPU sync required: ZeEvent from device-d's pool cannot be used as a
+            // zeCommandListAppendWaitOnEvents dependency on device-(1-d)'s command list
+            // unless created with ZE_EVENT_POOL_FLAG_CROSS_DEVICE (which the SYCL
+            // runtime does not do). CPU round-trip is short on intra-tile fabric.
             (void)DPCT_CHECK_ERROR(
                 s->memcpy(ctx->h_gpu1_norm, dc->d_x, n_embd * sizeof(float)));
             (void)DPCT_CHECK_ERROR(s->wait()); // CPU sync: h_gpu1_norm is now valid
 
-            // H2D: pinned host -> device next_d.
-            // No barrier or event needed: h_gpu1_norm is stable after s->wait().
-            // Kernels queued after this memcpy on next_dc->stream execute in
-            // FIFO order because it is an in-order SYCL queue.
             (void)dpct::select_device(next_d);
+            // H2D executes after the barrier; next_dc->stream is in-order so
+            // pp_queue_attn_and_router() calls below are also ordered behind it.
             (void)DPCT_CHECK_ERROR(next_dc->stream->memcpy(
                 next_dc->d_x, ctx->h_gpu1_norm, n_embd * sizeof(float)));
 
@@ -10665,26 +10484,18 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             }
 
             // GPU1 expert engine: collect partial sum and add to d_x.
-            // BUG FIX: the original code used ts->ext_oneapi_submit_barrier(
-            // {*ctx->gpu1.cache_event}) where ts=GPU0's transfer stream and
-            // cache_event was recorded on GPU1's stream.  This is the same
-            // cross-context event bug as in the pingpong relay: Level Zero maps
-            // the foreign event VA into GPU0's command stream, the MMU faults,
-            // and the device is lost.  Fix: CPU-side wait on the GPU1 event.
             if (use_gpu1 && n_gpu1_total > 0) {
-                // Wait for GPU1's weighted-sum + D2H (h_gpu1_partial) to complete
+
+                // BUG FIX: ts->ext_oneapi_submit_barrier({*ctx->gpu1.cache_event}) cannot
+                // work: cache_event is recorded on GPU1's stream (s1), ts is GPU0's transfer
+                // stream. Level Zero maps the foreign event VA into GPU0's command stream,
+                // the MMU faults, and the device is lost. Fix: CPU-side wait on the GPU1 event.
                 (void)DPCT_CHECK_ERROR(ctx->gpu1.cache_event->wait());
 
                 // H2D partial from pinned host to GPU0 device buffer
-                /*
-                DPCT1124:186: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
                 (void)DPCT_CHECK_ERROR(ts->memcpy(ctx->d_gpu1_partial,
-                                                  ctx->h_gpu1_partial,
-                                                  n_embd * sizeof(float)));
+                                                ctx->h_gpu1_partial,
+                                                n_embd * sizeof(float)));
                 (void)DPCT_CHECK_ERROR(
                     dpct::sync_barrier(ctx->batch_event[buf_set], ts));
 
@@ -11091,7 +10902,19 @@ extern "C" void gpu_reset_state(gpu_ctx_t *ctx) {
     memset(ctx->spec_valid, 0, sizeof(ctx->spec_valid));
     memset(ctx->spec2_valid, 0, sizeof(ctx->spec2_valid));
 
-    dpct::get_current_device().queues_wait_and_throw();
+    ctx->stream->wait();
+    ctx->transfer_stream->wait();
+    ctx->shared_stream->wait();
+    if (ctx->n_devices >= 2 && !ctx->pingpong) {
+        ctx->gpu1.stream->wait();
+        ctx->gpu1.transfer_stream->wait();
+    }
+    if (ctx->pingpong) {
+        for (int d = 0; d < 2; d++) {
+            ctx->dev[d].stream->wait();
+            ctx->dev[d].transfer_stream->wait();
+        }
+    }
 }
 
 // ============================================================
@@ -11159,10 +10982,8 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
     (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->batch_event[0]));
     (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->batch_event[1]));
     (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->shared_event));
-    (void)DPCT_CHECK_ERROR(
-        dpct::get_current_device().destroy_queue(ctx->transfer_stream));
-    (void)DPCT_CHECK_ERROR(
-        dpct::get_current_device().destroy_queue(ctx->shared_stream));
+    delete ctx->transfer_stream;  ctx->transfer_stream = nullptr;
+    delete ctx->shared_stream;    ctx->shared_stream   = nullptr;
 
     // Unregister any remaining buffers
     if (ctx->registered_bufs) {
@@ -11198,8 +11019,7 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
         pthread_cond_destroy(&ctx->bounce_worker.cond_done);
     }
 
-    if (ctx->h2d_bounce)(void) DPCT_CHECK_ERROR(
-        sycl::free(ctx->h2d_bounce, dpct::get_in_order_queue()));
+    if (ctx->h2d_bounce)     sycl::free(ctx->h2d_bounce,     *ctx->shared_ctx);
 
     // Expert frequency counter
     free(ctx->expert_freq);
@@ -11214,8 +11034,7 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
     }
 
     // Expert VRAM cache (v2 module)
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->ecache.d_buf, dpct::get_in_order_queue()));
+    sycl::free(ctx->ecache.d_buf, *ctx->shared_ctx);
     ctx->ecache.d_buf = nullptr;
     vram_cache_free(&ctx->ecache);
 
@@ -11228,178 +11047,107 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
                 continue;
             
             if (ctx->rcache.chunk_pinned[i / 64] & ((uint64_t)1 << (i & 63)))
-                (void)DPCT_CHECK_ERROR(sycl::free(ctx->rcache.chunks[i], *ctx->rcache_shared_ctx));
+                (void)DPCT_CHECK_ERROR(sycl::free(ctx->rcache.chunks[i], *ctx->shared_ctx));
             
             else free(ctx->rcache.chunks[i]);
         }
     }
     ram_cache_free(&ctx->rcache);
 
-    delete ctx->rcache_shared_ctx;
-    ctx->rcache_shared_ctx = NULL;
-
     // Expert FFN buffers
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_expert_staging, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_expert_ptrs, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_gate, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_up, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_down, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_scores, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ffn_out, dpct::get_in_order_queue()));
+    sycl::free(ctx->d_expert_staging, *ctx->shared_ctx);
+    sycl::free(ctx->d_expert_ptrs,    *ctx->shared_ctx);
+    sycl::free(ctx->d_gate,           *ctx->shared_ctx);
+    sycl::free(ctx->d_up,             *ctx->shared_ctx);
+    sycl::free(ctx->d_down,           *ctx->shared_ctx);
+    sycl::free(ctx->d_scores,         *ctx->shared_ctx);
+    sycl::free(ctx->d_ffn_out,        *ctx->shared_ctx);
 
     // Per-layer weights
     if (ctx->layers) {
         for (int i = 0; i < ctx->n_layers; i++) {
             struct gpu_layer *gl = &ctx->layers[i];
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_attn_norm, dpct::get_in_order_queue()));
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_ffn_norm, dpct::get_in_order_queue()));
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_router, dpct::get_in_order_queue()));
+            sycl::free(gl->d_attn_norm,         *ctx->shared_ctx);
+            sycl::free(gl->d_ffn_norm,          *ctx->shared_ctx);
+            sycl::free(gl->d_router,            *ctx->shared_ctx);
             if (gl->attn_type == LAYER_ATTN_FULL) {
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_wq, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_wk, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_wv, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_wo, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_q_norm, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_k_norm, dpct::get_in_order_queue()));
+                sycl::free(gl->d_wq,                *ctx->shared_ctx);
+                sycl::free(gl->d_wk,                *ctx->shared_ctx);
+                sycl::free(gl->d_wv,                *ctx->shared_ctx);
+                sycl::free(gl->d_wo,                *ctx->shared_ctx);
+                sycl::free(gl->d_q_norm,            *ctx->shared_ctx);
+                sycl::free(gl->d_k_norm,            *ctx->shared_ctx);
             } else {
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_attn_qkv, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_attn_gate, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_ssm_a, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_ssm_alpha, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_ssm_beta, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_ssm_conv1d, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_ssm_dt_bias, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(dpct::dpct_free(
-                    gl->d_ssm_norm, dpct::get_in_order_queue()));
-                (void)DPCT_CHECK_ERROR(
-                    dpct::dpct_free(gl->d_ssm_out, dpct::get_in_order_queue()));
+                sycl::free(gl->d_attn_qkv,          *ctx->shared_ctx);
+                sycl::free(gl->d_attn_gate,         *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_a,             *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_alpha,         *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_beta,          *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_conv1d,        *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_dt_bias,       *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_norm,          *ctx->shared_ctx);
+                sycl::free(gl->d_ssm_out,           *ctx->shared_ctx);
             }
-            (void)DPCT_CHECK_ERROR(dpct::dpct_free(gl->d_shared_expert_gate,
-                                                   dpct::get_in_order_queue()));
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_shared_gate, dpct::get_in_order_queue()));
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_shared_up, dpct::get_in_order_queue()));
-            (void)DPCT_CHECK_ERROR(
-                dpct::dpct_free(gl->d_shared_down, dpct::get_in_order_queue()));
+            sycl::free(gl->d_shared_expert_gate,*ctx->shared_ctx);
+            sycl::free(gl->d_shared_gate,       *ctx->shared_ctx);
+            sycl::free(gl->d_shared_up,         *ctx->shared_ctx);
+            sycl::free(gl->d_shared_down,       *ctx->shared_ctx);
         }
         free(ctx->layers);
     }
 
     // Global weights
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_token_embd, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_output, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_output_norm, dpct::get_in_order_queue()));
+    sycl::free(ctx->d_token_embd,   *ctx->shared_ctx);
+    sycl::free(ctx->d_output,       *ctx->shared_ctx);
+    sycl::free(ctx->d_output_norm,  *ctx->shared_ctx);
 
     // KV cache
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_kv_k, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_kv_v, dpct::get_in_order_queue()));
-    free(ctx->full_attn_layer_ids);
+    sycl::free(ctx->d_kv_k, *ctx->shared_ctx);
+    sycl::free(ctx->d_kv_v, *ctx->shared_ctx);
 
     // SSM state
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ssm_states, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ssm_conv_bufs, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ssm_conv_pos, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_ssm_conv_pos, dpct::get_in_order_queue()));
+    sycl::free(ctx->d_ssm_states,    *ctx->shared_ctx);
+    sycl::free(ctx->d_ssm_conv_bufs, *ctx->shared_ctx);
+    sycl::free(ctx->d_ssm_conv_pos,  *ctx->shared_ctx);
+    sycl::free(ctx->h_ssm_conv_pos,  *ctx->shared_ctx);
     free(ctx->ssm_layer_ids);
 
     // Scratch
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_x, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_norm, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_q, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_k, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_v, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_attn_out, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_attn_scores, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_attn_gate_buf, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_router_out, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ffn_buf, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_logits, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_top_k_ids, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_top_k_vals, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_spec_router_out, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_spec_top_k_ids, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_spec_top_k_vals, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ssm_dt, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_ssm_beta_buf, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_shared_gate_buf, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_shared_up_buf, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_shared_down_buf, dpct::get_in_order_queue()));
+    sycl::free(ctx->d_x,              *ctx->shared_ctx);
+    sycl::free(ctx->d_norm,           *ctx->shared_ctx);
+    sycl::free(ctx->d_q,              *ctx->shared_ctx);
+    sycl::free(ctx->d_k,              *ctx->shared_ctx);
+    sycl::free(ctx->d_v,              *ctx->shared_ctx);
+    sycl::free(ctx->d_attn_out,       *ctx->shared_ctx);
+    sycl::free(ctx->d_attn_scores,    *ctx->shared_ctx);
+    sycl::free(ctx->d_attn_gate_buf,  *ctx->shared_ctx);
+    sycl::free(ctx->d_router_out,     *ctx->shared_ctx);
+    sycl::free(ctx->d_ffn_buf,        *ctx->shared_ctx);
+    sycl::free(ctx->d_logits,         *ctx->shared_ctx);
+    sycl::free(ctx->d_top_k_ids,      *ctx->shared_ctx);
+    sycl::free(ctx->d_top_k_vals,     *ctx->shared_ctx);
+    sycl::free(ctx->d_spec_router_out,*ctx->shared_ctx);
+    sycl::free(ctx->d_spec_top_k_ids, *ctx->shared_ctx);
+    sycl::free(ctx->d_spec_top_k_vals,*ctx->shared_ctx);
+    sycl::free(ctx->d_ssm_dt,         *ctx->shared_ctx);
+    sycl::free(ctx->d_ssm_beta_buf,   *ctx->shared_ctx);
+    sycl::free(ctx->d_shared_gate_buf,*ctx->shared_ctx);
+    sycl::free(ctx->d_shared_up_buf,  *ctx->shared_ctx);
+    sycl::free(ctx->d_shared_down_buf,*ctx->shared_ctx);
 
     // Pinned host
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_router_out, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_top_k_ids, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_top_k_vals, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_spec_top_k_ids, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_all_scores, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_logits, dpct::get_in_order_queue()));
+    sycl::free(ctx->h_router_out, *ctx->shared_ctx);
+    sycl::free(ctx->h_top_k_ids, *ctx->shared_ctx);
+    sycl::free(ctx->h_top_k_vals, *ctx->shared_ctx);
+    sycl::free(ctx->h_spec_top_k_ids, *ctx->shared_ctx);
+    sycl::free(ctx->h_all_scores, *ctx->shared_ctx);
+    sycl::free(ctx->h_logits, *ctx->shared_ctx);
 
     // CPU expert compute
-    if (ctx->h_norm)(void)
-        DPCT_CHECK_ERROR(sycl::free(ctx->h_norm, dpct::get_in_order_queue()));
-    if (ctx->h_cpu_partial)(void) DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_cpu_partial, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_cpu_partial, dpct::get_in_order_queue()));
+    if (ctx->h_norm)        sycl::free(ctx->h_norm,        *ctx->shared_ctx);  // if changed to sycl::malloc_host
+    if (ctx->h_cpu_partial) sycl::free(ctx->h_cpu_partial, *ctx->shared_ctx);  // same
+    sycl::free(ctx->d_cpu_partial, *ctx->shared_ctx);
+
     if (ctx->cpu_expert) cpu_expert_free((cpu_expert_ctx_t *)ctx->cpu_expert);
 
     // GPU1 expert engine cleanup
@@ -11407,55 +11155,52 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
         (void)dpct::select_device(ctx->gpu1.device_id);
 
         // GPU1 VRAM cache
-        (void)DPCT_CHECK_ERROR(dpct::dpct_free(ctx->gpu1.ecache.d_buf,
-                                               dpct::get_in_order_queue()));
+        sycl::free(ctx->gpu1.ecache.d_buf,      *ctx->shared_ctx);
         ctx->gpu1.ecache.d_buf = nullptr;
         vram_cache_free(&ctx->gpu1.ecache);
 
         // GPU1 expert FFN buffers
-        (void)DPCT_CHECK_ERROR(dpct::dpct_free(ctx->gpu1.d_expert_staging,
-                                               dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(dpct::dpct_free(ctx->gpu1.d_expert_ptrs,
-                                               dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_gate, dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_up, dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_down, dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_scores, dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_ffn_out, dpct::get_in_order_queue()));
+        sycl::free(ctx->gpu1.d_expert_staging,  *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_expert_ptrs, *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_gate,        *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_up,          *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_down,        *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_scores,      *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_ffn_out,     *ctx->shared_ctx);
 
         // GPU1 scratch
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_norm, dpct::get_in_order_queue()));
-        (void)DPCT_CHECK_ERROR(
-            dpct::dpct_free(ctx->gpu1.d_partial, dpct::get_in_order_queue()));
+        sycl::free(ctx->gpu1.d_norm,            *ctx->shared_ctx);
+        sycl::free(ctx->gpu1.d_partial,         *ctx->shared_ctx);
 
         // GPU1 streams and events
         (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->gpu1.cache_event));
         (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->gpu1.batch_event[0]));
         (void)DPCT_CHECK_ERROR(dpct::destroy_event(ctx->gpu1.batch_event[1]));
-        (void)DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(
-            ctx->gpu1.transfer_stream));
-        (void)DPCT_CHECK_ERROR(
-            dpct::get_current_device().destroy_queue(ctx->gpu1.stream));
+        delete ctx->gpu1.transfer_stream;  ctx->gpu1.transfer_stream = nullptr;
+        delete ctx->gpu1.stream;           ctx->gpu1.stream           = nullptr;
 
         (void)dpct::select_device(0);
     }
 
-    // Inter-GPU pinned staging
-    if (ctx->h_gpu1_norm)(void) DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_gpu1_norm, dpct::get_in_order_queue()));
-    if (ctx->h_gpu1_partial)(void) DPCT_CHECK_ERROR(
-        sycl::free(ctx->h_gpu1_partial, dpct::get_in_order_queue()));
-    (void)DPCT_CHECK_ERROR(
-        dpct::dpct_free(ctx->d_gpu1_partial, dpct::get_in_order_queue()));
+    // Ping-pong per-device stream teardown (currently leaked — no prior cleanup)
+    if (ctx->pingpong) {
+        for (int d = 0; d < 2; d++) {
+            delete ctx->dev[d].transfer_stream; ctx->dev[d].transfer_stream = nullptr;
+            delete ctx->dev[d].stream;          ctx->dev[d].stream          = nullptr;
+        }
+    }
 
-    (void)DPCT_CHECK_ERROR(
-        dpct::get_current_device().destroy_queue(ctx->stream));
+    // Inter-GPU pinned staging
+
+    if (ctx->h_gpu1_norm)    sycl::free(ctx->h_gpu1_norm,    *ctx->shared_ctx);
+    if (ctx->h_gpu1_partial) sycl::free(ctx->h_gpu1_partial, *ctx->shared_ctx);
+    sycl::free(ctx->d_gpu1_partial, *ctx->shared_ctx);
+
+    delete ctx->stream;  ctx->stream = nullptr;
+
+    delete ctx->shared_ctx;
+    ctx->shared_ctx = NULL;
+
     free(ctx);
 }
 
