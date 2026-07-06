@@ -805,6 +805,7 @@ struct gpu_ctx {
         int buffer_offset;
         void *out_buffers[16];
         int result;
+        int gpu_id;
 
         // Per-expert H2D params (callback queues H2D as each read completes)
         hipStream_t h2d_stream;
@@ -4036,6 +4037,7 @@ static void nvme_h2d_callback(int buffer_idx, void *buffer, void *user_data) {
     memory, so you may need to call wait() on event return by memcpy API to
     ensure synchronization behavior.
     */
+    hipSetDevice(ctx->nvme_bg.gpu_id);
     (void)DPCT_CHECK_ERROR(
         ctx->nvme_bg.h2d_stream->memcpy(dst, buffer, stride));
 }
@@ -8372,6 +8374,7 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         // The NVMe background loader uses ctx->nvme_bg which targets GPU0 by default.
         // For ping-pong, we need to point it at the correct device's staging buffer.
         if (n_uncached > 0 && ctx->nvme_bg.active) {
+            ctx->nvme_bg.gpu_id = d;
             ctx->nvme_bg.h2d_stream = ts;
             ctx->nvme_bg.d_staging = (uint8_t *)dc->d_expert_staging;
             ctx->nvme_bg.stg_base = stg_base;
@@ -10142,6 +10145,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
         clock_gettime(CLOCK_MONOTONIC, &nvme_t0);
         bool nvme_bg_active = false;
         if (n_uncached > 0 && ctx->nvme_bg.active) {
+            ctx->nvme_bg.gpu_id = 0;
             ctx->nvme_bg.h2d_stream = ts;
             ctx->nvme_bg.d_staging = (uint8_t *)ctx->d_expert_staging;
             ctx->nvme_bg.stg_base = stg_base;
